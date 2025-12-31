@@ -1,6 +1,6 @@
 /**
  * Netlib auto login (robust)
- * VERSION: 2025-12-31 v6
+ * VERSION: 2025-12-31 v7
  *
  * Env:
  *  - ACCOUNTS="user1:pass1,user2:pass2"   (comma or semicolon separated)
@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-console.log('### login.js VERSION 2025-12-31 v6 ###');
+console.log('### login.js VERSION 2025-12-31 v7 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,7 +29,6 @@ const baseUrlRaw = process.env.BASE_URL || 'https://www.netlib.re/';
 function normalizeBaseUrl(u) {
   try {
     const url = new URL(u);
-    // keep origin + trailing slash
     return `${url.origin}/`;
   } catch {
     return 'https://www.netlib.re/';
@@ -88,7 +87,7 @@ function getActionsRunUrl() {
 async function sendTelegram(message) {
   if (!token || !chatId) return;
 
-  const maxLen = 3800; // keep buffer under Telegram 4096
+  const maxLen = 3800; // Telegram limit ~4096
   const text = message.length > maxLen ? message.slice(0, maxLen) + '\n\n...(truncated)' : message;
 
   try {
@@ -103,12 +102,43 @@ async function sendTelegram(message) {
   }
 }
 
+async function isDisconnected(page) {
+  const banner = page.getByText(/You have been disconnected/i);
+  return await banner.isVisible().catch(() => false);
+}
+
+/**
+ * Wait until the disconnected banner disappears automatically.
+ * (Do NOT click reconnect per your requirement.)
+ */
+async function waitForDisconnectedGone(page, timeoutMs = 30000) {
+  const banner = page.getByText(/You have been disconnected/i);
+  const t0 = Date.now();
+
+  while (Date.now() - t0 < timeoutMs) {
+    const visible = await banner.isVisible().catch(() => false);
+    if (!visible) return true;
+    await page.waitForTimeout(400);
+  }
+  return false;
+}
+
+/**
+ * Your required readiness gate:
+ * 1) Wait until "Read the news!" appears
+ * 2) Then wait until disconnected banner auto-disappears
+ */
+async function waitForHomeReady(page, timeoutMs = 30000) {
+  const readNews = page.getByText(/Read the news!/i);
+  await readNews.waitFor({ state: 'visible', timeout: timeoutMs });
+  return await waitForDisconnectedGone(page, timeoutMs);
+}
+
 /** Detect top "Invalid credentials" banner (not Logs) */
 async function hasTopInvalidBanner(page) {
-  // Prefer alert-like elements if present
-  const alertLoc = page.locator(
-    '.alert, .alert-danger, .notification, .toast, .snackbar'
-  ).filter({ hasText: /Invalid credentials/i });
+  const alertLoc = page
+    .locator('.alert, .alert-danger, .notification, .toast, .snackbar')
+    .filter({ hasText: /Invalid credentials/i });
 
   if (await alertLoc.first().isVisible().catch(() => false)) return true;
 
@@ -125,6 +155,7 @@ async function hasTopInvalidBanner(page) {
     if (box && typeof box.y === 'number') minY = Math.min(minY, box.y);
   }
 
+  // Logs area is usually lower; banner is near top
   return minY < 450;
 }
 
@@ -147,16 +178,16 @@ async function getLoginVerdictFromLogs(page, user) {
   const anchor = `authenticate (login: ${user})`;
   const idx = bodyText.lastIndexOf(anchor);
 
-  // If no anchor, still return tail snippet for debugging
+  // If no anchor, return last lines for debugging
   if (idx === -1) {
     const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-    const tail = lines.slice(-40).join('\n');
+    const tail = lines.slice(-50).join('\n');
     return { verdict: 'NONE', snippet: tail };
   }
 
   const tail = bodyText.slice(idx);
   const lines = tail.split('\n').map(l => l.trim()).filter(Boolean);
-  const snippet = lines.slice(0, 30).join('\n');
+  const snippet = lines.slice(0, 35).join('\n');
 
   const hasInvalid = /Error:\s*Invalid credentials\.?/i.test(tail);
   const hasAuthd = /Authenticated to authd\./i.test(tail);
@@ -168,47 +199,58 @@ async function getLoginVerdictFromLogs(page, user) {
 }
 
 /**
- * Strongly navigate to login page:
- * - read Login link href (if exists)
- * - try href + common fallbacks via goto (more reliable than click in headless)
- * - ensure username input is visible; if tabbed UI, click "Authentication" tab
+ * Navigate to login page reliably:
+ * - Try click (SPA route)
+ * - If inputs not visible, try goto on href + common fallbacks
+ * - If tabbed UI, click "Authentication" tab
  */
 async function gotoLoginPage(page, baseUrl) {
   const loginLink = page.getByRole('link', { name: /^login$/i }).first();
   const href = await loginLink.getAttribute('href').catch(() => null);
 
-  const candidates = [];
+  const userInput = page.locator('input[name="username"]');
 
-  if (href) {
-    try { candidates.push(new URL(href, baseUrl).toString()); } catch {}
-  }
+  // 1) Try click route (after home ready this should work often)
+  if (await loginLink.isVisible().catch(() => false)) {
+    await loginLink.scrollIntoViewIfNeeded().catch(() => {});
+    await loginLink.click({ timeout: 10000, force: true }).catch(() => {});
 
-  // Common fallbacks
-  candidates.push(
-    new URL('/login', baseUrl).toString(),
-    new URL('/auth', baseUrl).toString(),
-    new URL('/authentication', baseUrl).toString(),
-    new URL('/#/login', baseUrl).toString(),
-    new URL('/#/auth', baseUrl).toString(),
-    new URL('/#/authentication', baseUrl).toString()
-  );
-
-  const uniq = [...new Set(candidates)];
-
-  for (const url of uniq) {
-    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    // If tab exists, click it to reveal inputs
     const authTab = page.getByRole('link', { name: /^authentication$/i });
     if (await authTab.first().isVisible().catch(() => false)) {
       await authTab.first().click().catch(() => {});
     }
 
-    const userInput = page.locator('input[name="username"]');
-    const ok = await userInput.first().isVisible().catch(() => false);
-    if (ok) return { ok: true, href, tried: url, triedAll: uniq };
+    if (await userInput.first().isVisible().catch(() => false)) {
+      return { ok: true, href, tried: 'click(Login)' };
+    }
   }
 
-  return { ok: false, href, tried: uniq[0] || '', triedAll: uniq };
+  // 2) Try goto fallbacks
+  const candidates = [];
+  if (href) {
+    try { candidates.push(new URL(href, baseUrl).toString()); } catch {}
+  }
+  candidates.push(
+    new URL('/#/authentication', baseUrl).toString(),
+    new URL('/#/login', baseUrl).toString(),
+    new URL('/login', baseUrl).toString(),
+    new URL('/auth', baseUrl).toString()
+  );
+
+  for (const url of [...new Set(candidates)]) {
+    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+
+    const authTab = page.getByRole('link', { name: /^authentication$/i });
+    if (await authTab.first().isVisible().catch(() => false)) {
+      await authTab.first().click().catch(() => {});
+    }
+
+    if (await userInput.first().isVisible().catch(() => false)) {
+      return { ok: true, href, tried: url };
+    }
+  }
+
+  return { ok: false, href, tried: candidates[0] || '' };
 }
 
 async function loginWithAccount(user, pass) {
@@ -235,6 +277,7 @@ async function loginWithAccount(user, pass) {
     title: '',
     nav: { href: '', tried: '' },
     evidence: {
+      disconnected: false,
       topInvalid: false,
       uiMyDomains: false,
       uiOwnerText: false,
@@ -245,34 +288,59 @@ async function loginWithAccount(user, pass) {
   };
 
   try {
-    // Avoid reused storage/token affecting state
+    // avoid reused storage/token affecting state
     await page.addInitScript(() => {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
 
-    console.log(`📱 ${user} - 正在访问网站...`);
+    console.log(`📱 ${user} - 访问首页...`);
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
 
-    console.log(`🔑 ${user} - 打开登录页（强制goto）...`);
+    console.log(`⏳ ${user} - 等待首页就绪(Read the news!) 且断线提示自动消失...`);
+    const ready = await waitForHomeReady(page, 40000);
+    if (!ready) {
+      result.status = 'FAIL_UNKNOWN';
+      result.reason = '首页断线提示未自动消失（WebSocket不稳定/Actions网络问题）';
+      result.url = page.url();
+      result.title = await page.title().catch(() => '');
+      result.evidence.disconnected = await isDisconnected(page);
+
+      result.screenshot = `disconnected_${safeName(user)}.png`;
+      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+
+      const logs = await getLoginVerdictFromLogs(page, user);
+      result.logsSnippet = logs.snippet || '';
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      return result;
+    }
+
+    console.log(`🔑 ${user} - 打开登录页...`);
     const nav = await gotoLoginPage(page, baseUrl);
     result.nav.href = nav.href || '';
     result.nav.tried = nav.tried || '';
     console.log(`🔗 ${user} - login href=${result.nav.href || '(null)'} ; tried=${result.nav.tried}`);
 
+    // 登录页也可能短暂断线：按你的要求只等待它自动消失
+    await waitForDisconnectedGone(page, 20000).catch(() => {});
+
     if (!nav.ok) {
       result.status = 'FAIL_UNKNOWN';
-      result.reason = '无法进入登录页（Login href/路由可能变更，或登录页被拦截）';
+      result.reason = '无法进入登录页（Login 路由/页面结构可能变化）';
       result.url = page.url();
       result.title = await page.title().catch(() => '');
+      result.evidence.disconnected = await isDisconnected(page);
+
       result.screenshot = `no_login_page_${safeName(user)}.png`;
       await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      result.logsSnippet = (await getLoginVerdictFromLogs(page, user)).snippet || '';
+
+      const logs = await getLoginVerdictFromLogs(page, user);
+      result.logsSnippet = logs.snippet || '';
       await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
-    // Ensure form is visible
-    await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 15000 });
+    // Ensure inputs are visible
+    await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 20000 });
 
     console.log(`📝 ${user} - 填写用户名...`);
     await page.locator('input[name="username"]').fill(user);
@@ -283,23 +351,30 @@ async function loginWithAccount(user, pass) {
     console.log(`📤 ${user} - 提交登录(Validate)...`);
     await page.getByRole('button', { name: /^validate$/i }).click();
 
-    // Wait for any sign: top error / UI success / logs anchor line
+    // Wait for any sign: top invalid / UI success / logs anchor
     const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
 
     const t0 = Date.now();
-    while (Date.now() - t0 < 30000) {
+    while (Date.now() - t0 < 35000) {
+      // If disconnected shows up, wait it to go away automatically and keep waiting
+      if (await isDisconnected(page)) {
+        await waitForDisconnectedGone(page, 15000).catch(() => {});
+      }
+
       const topInvalid = await hasTopInvalidBanner(page);
       const ui = await getSuccessSignalsUI(page);
       const hasAnchor = await anchorLoc.first().isVisible().catch(() => false);
+
       if (topInvalid || ui.success || hasAnchor) break;
-      await page.waitForTimeout(300);
+      await page.waitForTimeout(350);
     }
 
-    // Let logs append Authenticated/Error after anchor
+    // Allow logs to append Authenticated/Error after anchor
     await page.waitForTimeout(2000);
 
     result.url = page.url();
     result.title = await page.title().catch(() => '');
+    result.evidence.disconnected = await isDisconnected(page);
 
     // Evidence
     result.evidence.topInvalid = await hasTopInvalidBanner(page);
@@ -310,9 +385,10 @@ async function loginWithAccount(user, pass) {
     const logs = await getLoginVerdictFromLogs(page, user);
     result.evidence.logsVerdict = logs.verdict;
     result.logsSnippet = logs.snippet || '';
+    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
 
     console.log(
-      `🔍 ${user} - evidence: topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
+      `🔍 ${user} - evidence: disconnected=${result.evidence.disconnected}, topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
     );
 
     // Decide (priority: UI top invalid > logs invalid > UI success > logs success > unknown)
@@ -322,9 +398,9 @@ async function loginWithAccount(user, pass) {
         ? '账号或密码错误（顶部出现 Invalid credentials）'
         : '账号或密码错误（Logs 出现 Error: Invalid credentials）';
       result.success = false;
+
       result.screenshot = `fail_${safeName(user)}.png`;
       await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
@@ -334,16 +410,17 @@ async function loginWithAccount(user, pass) {
         ? (ui.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...')
         : '检测到成功日志: Authenticated to authd + dnsmanagerd';
       result.success = true;
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
     result.status = 'FAIL_UNKNOWN';
-    result.reason = '未能判定：UI 未出现成功/错误条，Logs 也未给出明确 SUCCESS/Invalid（见截图与 logs_*.txt）';
+    result.reason = result.evidence.disconnected
+      ? '未能判定：提交后页面仍处于 disconnected（WS不稳定），见截图与 logs_*.txt'
+      : '未能判定：UI 未出现成功/错误条，Logs 也未给出明确 SUCCESS/Invalid（见截图与 logs_*.txt）';
     result.success = false;
+
     result.screenshot = `unknown_${safeName(user)}.png`;
     await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
     return result;
 
   } catch (e) {
@@ -352,9 +429,11 @@ async function loginWithAccount(user, pass) {
     result.reason = `脚本异常: ${e?.message || e}`;
     result.url = page?.url?.() || '';
     result.title = await page?.title?.().catch(() => '') || '';
+    result.evidence.disconnected = await isDisconnected(page).catch(() => false);
+
     result.screenshot = `error_${safeName(user)}.png`;
     await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-    // save whatever logs we can
+
     const logs = await getLoginVerdictFromLogs(page, user).catch(() => ({ snippet: '' }));
     result.logsSnippet = logs?.snippet || '';
     await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
@@ -382,7 +461,7 @@ function formatResultBlock(r) {
     `账号：${r.user}\n` +
     `结果：${statusZh} (${r.status})\n` +
     `原因：${r.reason}\n` +
-    `证据：topInvalid=${!!ev.topInvalid}, uiMyDomains=${!!ev.uiMyDomains}, uiOwnerText=${!!ev.uiOwnerText}, logsVerdict=${ev.logsVerdict}\n` +
+    `证据：disconnected=${!!ev.disconnected}, topInvalid=${!!ev.topInvalid}, uiMyDomains=${!!ev.uiMyDomains}, uiOwnerText=${!!ev.uiOwnerText}, logsVerdict=${ev.logsVerdict}\n` +
     `Login入口：href=${nav.href || '(null)'} ; tried=${nav.tried || '(none)'}\n`;
 
   if (r.title) s += `Title：${r.title}\n`;
@@ -406,6 +485,7 @@ async function main() {
   for (let i = 0; i < accountList.length; i++) {
     const { user, pass } = accountList[i];
     console.log(`\n📋 处理第 ${i + 1}/${accountList.length} 个账号: ${user}`);
+
     const r = await loginWithAccount(user, pass);
     results.push(r);
 
