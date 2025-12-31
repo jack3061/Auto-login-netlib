@@ -82,16 +82,24 @@ async function loginWithAccount(user, pass) {
     // 检查登录是否成功
     const pageContent = await page.content();
     
-    // 登录成功的标志：出现认证成功的日志
-    const isAuthenticated = pageContent.includes('Authenticated to authd') || 
-                            pageContent.includes('Authenticated to dnsmanagerd') ||
-                            pageContent.includes('System: authenticate');
+    // 登录失败的标志：出现 "Invalid credentials" 错误
+    const hasInvalidCredentials = pageContent.includes('Invalid credentials');
     
-    if (isAuthenticated) {
+    // 登录成功的标志：同时认证到 authd 和 dnsmanagerd
+    const authSuccess = pageContent.includes('Authenticated to authd');
+    const dnsSuccess = pageContent.includes('Authenticated to dnsmanagerd');
+    
+    if (hasInvalidCredentials) {
+      // 明确检测到登录失败
+      console.log(`❌ ${user} - 登录失败: 账号或密码错误`);
+      result.message = `❌ ${user} 登录失败: 账号或密码错误`;
+    } else if (authSuccess && dnsSuccess) {
+      // 同时通过两个认证才算成功
       console.log(`✅ ${user} - 登录成功`);
       result.success = true;
       result.message = `✅ ${user} 登录成功`;
     } else {
+      // 其他情况视为失败
       console.log(`❌ ${user} - 登录失败`);
       result.message = `❌ ${user} 登录失败`;
     }
