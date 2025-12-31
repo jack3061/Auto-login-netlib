@@ -82,7 +82,12 @@ async function loginWithAccount(user, pass) {
     // 检查登录是否成功
     const pageContent = await page.content();
     
-    if (pageContent.includes('exclusive owner') || pageContent.includes(user)) {
+    // 登录成功的标志：出现认证成功的日志
+    const isAuthenticated = pageContent.includes('Authenticated to authd') || 
+                            pageContent.includes('Authenticated to dnsmanagerd') ||
+                            pageContent.includes('System: authenticate');
+    
+    if (isAuthenticated) {
       console.log(`✅ ${user} - 登录成功`);
       result.success = true;
       result.message = `✅ ${user} 登录成功`;
