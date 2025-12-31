@@ -1,6 +1,6 @@
 /**
  * Netlib auto login (robust)
- * VERSION: 2025-12-31 v5
+ * VERSION: 2025-12-31 v6
  *
  * Env:
  *  - ACCOUNTS="user1:pass1,user2:pass2"   (comma or semicolon separated)
@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-console.log('### login.js VERSION 2025-12-31 v5 ###');
+console.log('### login.js VERSION 2025-12-31 v6 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -24,7 +24,19 @@ console.log('### FILE PATH:', __filename);
 const token = process.env.BOT_TOKEN;
 const chatId = process.env.CHAT_ID;
 const accountsRaw = process.env.ACCOUNTS || '';
-const baseUrl = process.env.BASE_URL || 'https://www.netlib.re/';
+const baseUrlRaw = process.env.BASE_URL || 'https://www.netlib.re/';
+
+function normalizeBaseUrl(u) {
+  try {
+    const url = new URL(u);
+    // keep origin + trailing slash
+    return `${url.origin}/`;
+  } catch {
+    return 'https://www.netlib.re/';
+  }
+}
+
+const baseUrl = normalizeBaseUrl(baseUrlRaw);
 
 function hktTimeString() {
   const now = new Date();
@@ -76,8 +88,7 @@ function getActionsRunUrl() {
 async function sendTelegram(message) {
   if (!token || !chatId) return;
 
-  // Telegram limit ~4096
-  const maxLen = 3800;
+  const maxLen = 3800; // keep buffer under Telegram 4096
   const text = message.length > maxLen ? message.slice(0, maxLen) + '\n\n...(truncated)' : message;
 
   try {
@@ -92,9 +103,9 @@ async function sendTelegram(message) {
   }
 }
 
-/** Try to detect the TOP red banner, not the Logs entry */
+/** Detect top "Invalid credentials" banner (not Logs) */
 async function hasTopInvalidBanner(page) {
-  // Prefer bootstrap-like alerts if present
+  // Prefer alert-like elements if present
   const alertLoc = page.locator(
     '.alert, .alert-danger, .notification, .toast, .snackbar'
   ).filter({ hasText: /Invalid credentials/i });
@@ -114,16 +125,14 @@ async function hasTopInvalidBanner(page) {
     if (box && typeof box.y === 'number') minY = Math.min(minY, box.y);
   }
 
-  return minY < 450; // relaxed threshold for headless layout
+  return minY < 450;
 }
 
 async function getSuccessSignalsUI(page) {
   const myDomainsHeading = page.getByRole('heading', { name: /my domains/i });
-  const myDomainsText = page.getByText(/my domains/i);
   const ownerText = page.getByText(/You are the exclusive owner of the following domains\./i);
 
-  const hasHeading = await myDomainsHeading.first().isVisible().catch(() => false);
-  const hasMyDomains = hasHeading || (await myDomainsText.first().isVisible().catch(() => false));
+  const hasMyDomains = await myDomainsHeading.first().isVisible().catch(() => false);
   const hasOwnerText = await ownerText.first().isVisible().catch(() => false);
 
   return { hasMyDomains, hasOwnerText, success: hasMyDomains || hasOwnerText };
@@ -131,23 +140,23 @@ async function getSuccessSignalsUI(page) {
 
 /**
  * Parse Logs from body.innerText, but ONLY after the LAST
- * "System: authenticate (login: user)" occurrence.
+ * "authenticate (login: user)" occurrence.
  */
 async function getLoginVerdictFromLogs(page, user) {
   const bodyText = await page.evaluate(() => document.body?.innerText || '');
   const anchor = `authenticate (login: ${user})`;
   const idx = bodyText.lastIndexOf(anchor);
-  if (idx === -1) return { verdict: 'NONE', snippet: '' };
+
+  // If no anchor, still return tail snippet for debugging
+  if (idx === -1) {
+    const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
+    const tail = lines.slice(-40).join('\n');
+    return { verdict: 'NONE', snippet: tail };
+  }
 
   const tail = bodyText.slice(idx);
-
-  // Keep a short snippet for Telegram debugging
-  const lines = tail
-    .split('\n')
-    .map(l => l.trim())
-    .filter(Boolean);
-
-  const snippet = lines.slice(0, 25).join('\n'); // first 25 lines after anchor
+  const lines = tail.split('\n').map(l => l.trim()).filter(Boolean);
+  const snippet = lines.slice(0, 30).join('\n');
 
   const hasInvalid = /Error:\s*Invalid credentials\.?/i.test(tail);
   const hasAuthd = /Authenticated to authd\./i.test(tail);
@@ -155,8 +164,51 @@ async function getLoginVerdictFromLogs(page, user) {
 
   if (hasInvalid) return { verdict: 'FAIL_INVALID', snippet };
   if (hasAuthd && hasDns) return { verdict: 'SUCCESS', snippet };
-
   return { verdict: 'UNKNOWN', snippet };
+}
+
+/**
+ * Strongly navigate to login page:
+ * - read Login link href (if exists)
+ * - try href + common fallbacks via goto (more reliable than click in headless)
+ * - ensure username input is visible; if tabbed UI, click "Authentication" tab
+ */
+async function gotoLoginPage(page, baseUrl) {
+  const loginLink = page.getByRole('link', { name: /^login$/i }).first();
+  const href = await loginLink.getAttribute('href').catch(() => null);
+
+  const candidates = [];
+
+  if (href) {
+    try { candidates.push(new URL(href, baseUrl).toString()); } catch {}
+  }
+
+  // Common fallbacks
+  candidates.push(
+    new URL('/login', baseUrl).toString(),
+    new URL('/auth', baseUrl).toString(),
+    new URL('/authentication', baseUrl).toString(),
+    new URL('/#/login', baseUrl).toString(),
+    new URL('/#/auth', baseUrl).toString(),
+    new URL('/#/authentication', baseUrl).toString()
+  );
+
+  const uniq = [...new Set(candidates)];
+
+  for (const url of uniq) {
+    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    // If tab exists, click it to reveal inputs
+    const authTab = page.getByRole('link', { name: /^authentication$/i });
+    if (await authTab.first().isVisible().catch(() => false)) {
+      await authTab.first().click().catch(() => {});
+    }
+
+    const userInput = page.locator('input[name="username"]');
+    const ok = await userInput.first().isVisible().catch(() => false);
+    if (ok) return { ok: true, href, tried: url, triedAll: uniq };
+  }
+
+  return { ok: false, href, tried: uniq[0] || '', triedAll: uniq };
 }
 
 async function loginWithAccount(user, pass) {
@@ -181,6 +233,7 @@ async function loginWithAccount(user, pass) {
     reason: '',
     url: '',
     title: '',
+    nav: { href: '', tried: '' },
     evidence: {
       topInvalid: false,
       uiMyDomains: false,
@@ -192,7 +245,7 @@ async function loginWithAccount(user, pass) {
   };
 
   try {
-    // reduce chance of reused storage/token
+    // Avoid reused storage/token affecting state
     await page.addInitScript(() => {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
@@ -200,10 +253,25 @@ async function loginWithAccount(user, pass) {
     console.log(`📱 ${user} - 正在访问网站...`);
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
 
-    console.log(`🔑 ${user} - 点击 Login...`);
-    await page.getByRole('link', { name: /^login$/i }).first().click({ timeout: 10000 });
+    console.log(`🔑 ${user} - 打开登录页（强制goto）...`);
+    const nav = await gotoLoginPage(page, baseUrl);
+    result.nav.href = nav.href || '';
+    result.nav.tried = nav.tried || '';
+    console.log(`🔗 ${user} - login href=${result.nav.href || '(null)'} ; tried=${result.nav.tried}`);
 
-    // wait for auth form
+    if (!nav.ok) {
+      result.status = 'FAIL_UNKNOWN';
+      result.reason = '无法进入登录页（Login href/路由可能变更，或登录页被拦截）';
+      result.url = page.url();
+      result.title = await page.title().catch(() => '');
+      result.screenshot = `no_login_page_${safeName(user)}.png`;
+      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      result.logsSnippet = (await getLoginVerdictFromLogs(page, user)).snippet || '';
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      return result;
+    }
+
+    // Ensure form is visible
     await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 15000 });
 
     console.log(`📝 ${user} - 填写用户名...`);
@@ -215,7 +283,7 @@ async function loginWithAccount(user, pass) {
     console.log(`📤 ${user} - 提交登录(Validate)...`);
     await page.getByRole('button', { name: /^validate$/i }).click();
 
-    // Wait up to 30s for any sign (UI fail / UI success / logs anchor line)
+    // Wait for any sign: top error / UI success / logs anchor line
     const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
 
     const t0 = Date.now();
@@ -223,44 +291,40 @@ async function loginWithAccount(user, pass) {
       const topInvalid = await hasTopInvalidBanner(page);
       const ui = await getSuccessSignalsUI(page);
       const hasAnchor = await anchorLoc.first().isVisible().catch(() => false);
-
       if (topInvalid || ui.success || hasAnchor) break;
       await page.waitForTimeout(300);
     }
 
-    // Give logs a bit time to append Authenticated/Error after anchor appears
-    await page.waitForTimeout(1500);
+    // Let logs append Authenticated/Error after anchor
+    await page.waitForTimeout(2000);
 
     result.url = page.url();
     result.title = await page.title().catch(() => '');
 
-    // UI checks
+    // Evidence
     result.evidence.topInvalid = await hasTopInvalidBanner(page);
     const ui = await getSuccessSignalsUI(page);
     result.evidence.uiMyDomains = ui.hasMyDomains;
     result.evidence.uiOwnerText = ui.hasOwnerText;
 
-    // Logs-based fallback
     const logs = await getLoginVerdictFromLogs(page, user);
     result.evidence.logsVerdict = logs.verdict;
-    result.logsSnippet = logs.snippet;
+    result.logsSnippet = logs.snippet || '';
 
     console.log(
       `🔍 ${user} - evidence: topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
     );
 
-    // Final decision (priority: UI top error > logs invalid > UI success > logs success > unknown)
+    // Decide (priority: UI top invalid > logs invalid > UI success > logs success > unknown)
     if (result.evidence.topInvalid || logs.verdict === 'FAIL_INVALID') {
       result.status = 'FAIL_INVALID';
       result.reason = result.evidence.topInvalid
         ? '账号或密码错误（顶部出现 Invalid credentials）'
         : '账号或密码错误（Logs 出现 Error: Invalid credentials）';
       result.success = false;
-
       result.screenshot = `fail_${safeName(user)}.png`;
       await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
-      console.log(`❌ ${user} - 登录失败（密码错误）`);
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
@@ -270,24 +334,16 @@ async function loginWithAccount(user, pass) {
         ? (ui.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...')
         : '检测到成功日志: Authenticated to authd + dnsmanagerd';
       result.success = true;
-
-      // optional: screenshot on success too (comment out if you don't want)
-      // result.screenshot = `success_${safeName(user)}.png`;
-      // await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
-      console.log(`✅ ${user} - 登录成功`);
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
-    // Unknown
     result.status = 'FAIL_UNKNOWN';
     result.reason = '未能判定：UI 未出现成功/错误条，Logs 也未给出明确 SUCCESS/Invalid（见截图与 logs_*.txt）';
     result.success = false;
-
     result.screenshot = `unknown_${safeName(user)}.png`;
     await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
-    console.log(`❌ ${user} - 登录失败（未判定，已截图+保存日志）`);
+    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
     return result;
 
   } catch (e) {
@@ -296,10 +352,12 @@ async function loginWithAccount(user, pass) {
     result.reason = `脚本异常: ${e?.message || e}`;
     result.url = page?.url?.() || '';
     result.title = await page?.title?.().catch(() => '') || '';
-
     result.screenshot = `error_${safeName(user)}.png`;
     await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-    console.log(`❌ ${user} - 登录异常: ${e?.message || e}`);
+    // save whatever logs we can
+    const logs = await getLoginVerdictFromLogs(page, user).catch(() => ({ snippet: '' }));
+    result.logsSnippet = logs?.snippet || '';
+    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
     return result;
 
   } finally {
@@ -318,20 +376,22 @@ function formatResultBlock(r) {
   }[r.status] || r.status;
 
   const ev = r.evidence || {};
+  const nav = r.nav || {};
+
   let s =
     `账号：${r.user}\n` +
     `结果：${statusZh} (${r.status})\n` +
     `原因：${r.reason}\n` +
-    `证据：topInvalid=${!!ev.topInvalid}, uiMyDomains=${!!ev.uiMyDomains}, uiOwnerText=${!!ev.uiOwnerText}, logsVerdict=${ev.logsVerdict}\n`;
+    `证据：topInvalid=${!!ev.topInvalid}, uiMyDomains=${!!ev.uiMyDomains}, uiOwnerText=${!!ev.uiOwnerText}, logsVerdict=${ev.logsVerdict}\n` +
+    `Login入口：href=${nav.href || '(null)'} ; tried=${nav.tried || '(none)'}\n`;
 
   if (r.title) s += `Title：${r.title}\n`;
   if (r.url) s += `URL：${r.url}\n`;
   if (r.screenshot) s += `截图：${r.screenshot}\n`;
   s += `Logs：logs_${safeName(r.user)}.txt\n`;
 
-  // add a small logs preview in telegram (avoid too long)
   if (r.logsSnippet) {
-    const preview = r.logsSnippet.split('\n').slice(0, 8).join('\n');
+    const preview = r.logsSnippet.split('\n').slice(0, 10).join('\n');
     s += `Logs预览：\n${preview}\n`;
   }
 
@@ -346,7 +406,6 @@ async function main() {
   for (let i = 0; i < accountList.length; i++) {
     const { user, pass } = accountList[i];
     console.log(`\n📋 处理第 ${i + 1}/${accountList.length} 个账号: ${user}`);
-
     const r = await loginWithAccount(user, pass);
     results.push(r);
 
