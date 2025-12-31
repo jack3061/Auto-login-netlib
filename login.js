@@ -10,26 +10,22 @@ if (!accounts) {
   process.exit(1);
 }
 
-// 解析多个账号，支持逗号或分号分隔
 const accountList = accounts.split(/[,;]/).map(account => {
   const [user, pass] = account.split(":").map(s => s.trim());
   return { user, pass };
 }).filter(acc => acc.user && acc.pass);
 
 if (accountList.length === 0) {
-  console.log('❌ 账号格式错误，应为 username1:password1,username2:password2');
+  console.log('❌ 账号格式错误');
   process.exit(1);
 }
 
 async function sendTelegram(message) {
   if (!token || !chatId) return;
-
   const now = new Date();
   const hkTime = new Date(now.getTime() + (8 * 60 * 60 * 1000));
   const timeStr = hkTime.toISOString().replace('T', ' ').substr(0, 19) + " HKT";
-
   const fullMessage = `🎉 Netlib 登录通知\n\n登录时间：${timeStr}\n\n${message}`;
-
   try {
     await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
       chat_id: chatId,
@@ -42,13 +38,11 @@ async function sendTelegram(message) {
 }
 
 async function loginWithAccount(user, pass) {
-  console.log(`\n🚀 开始登录账号: ${user}`);
-  
+  console.log(`🚀 开始登录: ${user}`);
   const browser = await chromium.launch({ 
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
-  
   let page;
   let result = { user, success: false, message: '' };
   
@@ -62,7 +56,6 @@ async function loginWithAccount(user, pass) {
     
     console.log(`🔑 ${user} - 点击登录按钮...`);
     await page.click('text=Login', { timeout: 5000 });
-    
     await page.waitForTimeout(2000);
     
     console.log(`📝 ${user} - 填写用户名...`);
@@ -75,81 +68,59 @@ async function loginWithAccount(user, pass) {
     
     console.log(`📤 ${user} - 提交登录...`);
     await page.click('button:has-text("Validate"), input[type="submit"]');
-    
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(8000);
     
-    // 获取页面文本内容
     const pageText = await page.evaluate(() => document.body.innerText);
     
-    // 调试：打印页面关键内容
-    console.log(`\n========== 调试信息 ==========`);
-    console.log(`🔍 ${user} - 检查页面内容...`);
-    console.log(`   - 包含 Invalid credentials: ${pageText.includes('Invalid credentials')}`);
-    console.log(`   - 包含 Authenticated to authd: ${pageText.includes('Authenticated to authd')}`);
-    console.log(`   - 包含 Authenticated to dnsmanagerd: ${pageText.includes('Authenticated to dnsmanagerd')}`);
-    console.log(`========== 调试结束 ==========\n`);
+    console.log(`==== DEBUG START ====`);
+    console.log(`Invalid credentials: ${pageText.includes('Invalid credentials')}`);
+    console.log(`Authenticated to authd: ${pageText.includes('Authenticated to authd')}`);
+    console.log(`Authenticated to dnsmanagerd: ${pageText.includes('Authenticated to dnsmanagerd')}`);
+    console.log(`==== DEBUG END ====`);
     
-    // 登录失败的标志
-    const hasInvalidCredentials = pageText.includes('Invalid credentials');
+    const hasError = pageText.includes('Invalid credentials');
+    const authOK = pageText.includes('Authenticated to authd');
+    const dnsOK = pageText.includes('Authenticated to dnsmanagerd');
     
-    // 登录成功的标志
-    const authSuccess = pageText.includes('Authenticated to authd');
-    const dnsSuccess = pageText.includes('Authenticated to dnsmanagerd');
-    
-    if (hasInvalidCredentials) {
-      console.log(`❌ ${user} - 登录失败: 账号或密码错误`);
-      result.message = `❌ ${user} 登录失败: 账号或密码错误`;
-    } else if (authSuccess && dnsSuccess) {
+    if (hasError) {
+      console.log(`❌ ${user} - 登录失败: 密码错误`);
+      result.message = `❌ ${user} 登录失败`;
+    } else if (authOK && dnsOK) {
       console.log(`✅ ${user} - 登录成功`);
       result.success = true;
       result.message = `✅ ${user} 登录成功`;
     } else {
-      console.log(`❌ ${user} - 登录失败: 认证未完成`);
+      console.log(`❌ ${user} - 登录失败`);
       result.message = `❌ ${user} 登录失败`;
     }
-    
   } catch (e) {
-    console.log(`❌ ${user} - 登录异常: ${e.message}`);
-    result.message = `❌ ${user} 登录异常: ${e.message}`;
+    console.log(`❌ ${user} - 异常: ${e.message}`);
+    result.message = `❌ ${user} 登录异常`;
   } finally {
     if (page) await page.close();
     await browser.close();
   }
-  
   return result;
 }
 
 async function main() {
-  console.log(`🔍 发现 ${accountList.length} 个账号需要登录`);
-  
+  console.log(`🔍 发现 ${accountList.length} 个账号`);
   const results = [];
-  
   for (let i = 0; i < accountList.length; i++) {
     const { user, pass } = accountList[i];
-    console.log(`\n📋 处理第 ${i + 1}/${accountList.length} 个账号: ${user}`);
-    
+    console.log(`📋 处理第 ${i + 1}/${accountList.length} 个账号: ${user}`);
     const result = await loginWithAccount(user, pass);
     results.push(result);
-    
     if (i < accountList.length - 1) {
-      console.log('⏳ 等待3秒后处理下一个账号...');
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
-  
   const successCount = results.filter(r => r.success).length;
-  const totalCount = results.length;
-  
-  let summaryMessage = `📊 登录汇总: ${successCount}/${totalCount} 个账号成功\n\n`;
-  
-  results.forEach(result => {
-    summaryMessage += `${result.message}\n`;
-  });
-  
+  let summaryMessage = `📊 登录汇总: ${successCount}/${results.length} 成功\n\n`;
+  results.forEach(r => { summaryMessage += `${r.message}\n`; });
   await sendTelegram(summaryMessage);
-  
-  console.log('\n✅ 所有账号处理完成！');
+  console.log('✅ 所有账号处理完成！');
 }
 
 main().catch(console.error);
