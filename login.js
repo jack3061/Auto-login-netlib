@@ -77,16 +77,18 @@ async function loginWithAccount(user, pass) {
     await page.click('button:has-text("Validate"), input[type="submit"]');
     
     await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(8000);
     
-    // 获取页面文本内容（更可靠）
+    // 获取页面文本内容
     const pageText = await page.evaluate(() => document.body.innerText);
     
     // 调试：打印页面关键内容
+    console.log(`\n========== 调试信息 ==========`);
     console.log(`🔍 ${user} - 检查页面内容...`);
-    console.log(`   - 包含 "Invalid credentials": ${pageText.includes('Invalid credentials')}`);
-    console.log(`   - 包含 "Authenticated to authd": ${pageText.includes('Authenticated to authd')}`);
-    console.log(`   - 包含 "Authenticated to dnsmanagerd": ${pageText.includes('Authenticated to dnsmanagerd')}`);
+    console.log(`   - 包含 Invalid credentials: ${pageText.includes('Invalid credentials')}`);
+    console.log(`   - 包含 Authenticated to authd: ${pageText.includes('Authenticated to authd')}`);
+    console.log(`   - 包含 Authenticated to dnsmanagerd: ${pageText.includes('Authenticated to dnsmanagerd')}`);
+    console.log(`========== 调试结束 ==========\n`);
     
     // 登录失败的标志
     const hasInvalidCredentials = pageText.includes('Invalid credentials');
@@ -130,14 +132,12 @@ async function main() {
     const result = await loginWithAccount(user, pass);
     results.push(result);
     
-    // 如果不是最后一个账号，等待一下再处理下一个
     if (i < accountList.length - 1) {
       console.log('⏳ 等待3秒后处理下一个账号...');
       await new Promise(resolve => setTimeout(resolve, 3000));
     }
   }
   
-  // 汇总所有结果并发送一条消息
   const successCount = results.filter(r => r.success).length;
   const totalCount = results.length;
   
