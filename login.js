@@ -79,28 +79,31 @@ async function loginWithAccount(user, pass) {
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(5000);
     
-    // 检查登录是否成功
-    const pageContent = await page.content();
+    // 获取页面文本内容（更可靠）
+    const pageText = await page.evaluate(() => document.body.innerText);
     
-    // 登录失败的标志：出现 "Invalid credentials" 错误
-    const hasInvalidCredentials = pageContent.includes('Invalid credentials');
+    // 调试：打印页面关键内容
+    console.log(`🔍 ${user} - 检查页面内容...`);
+    console.log(`   - 包含 "Invalid credentials": ${pageText.includes('Invalid credentials')}`);
+    console.log(`   - 包含 "Authenticated to authd": ${pageText.includes('Authenticated to authd')}`);
+    console.log(`   - 包含 "Authenticated to dnsmanagerd": ${pageText.includes('Authenticated to dnsmanagerd')}`);
     
-    // 登录成功的标志：同时认证到 authd 和 dnsmanagerd
-    const authSuccess = pageContent.includes('Authenticated to authd');
-    const dnsSuccess = pageContent.includes('Authenticated to dnsmanagerd');
+    // 登录失败的标志
+    const hasInvalidCredentials = pageText.includes('Invalid credentials');
+    
+    // 登录成功的标志
+    const authSuccess = pageText.includes('Authenticated to authd');
+    const dnsSuccess = pageText.includes('Authenticated to dnsmanagerd');
     
     if (hasInvalidCredentials) {
-      // 明确检测到登录失败
       console.log(`❌ ${user} - 登录失败: 账号或密码错误`);
       result.message = `❌ ${user} 登录失败: 账号或密码错误`;
     } else if (authSuccess && dnsSuccess) {
-      // 同时通过两个认证才算成功
       console.log(`✅ ${user} - 登录成功`);
       result.success = true;
       result.message = `✅ ${user} 登录成功`;
     } else {
-      // 其他情况视为失败
-      console.log(`❌ ${user} - 登录失败`);
+      console.log(`❌ ${user} - 登录失败: 认证未完成`);
       result.message = `❌ ${user} 登录失败`;
     }
     
