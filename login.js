@@ -1,6 +1,6 @@
 /**
- * ### Netlib auto login (robust) ###
- * VERSION: 2025-12-31 v3
+ * Netlib auto login (robust)
+ * VERSION: 2025-12-31 v4
  *
  * Env:
  *  - ACCOUNTS="user1:pass1,user2:pass2"   (comma or semicolon separated)
@@ -14,7 +14,7 @@ import { chromium } from 'playwright';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-console.log('### login.js VERSION 2025-12-31 v3 ###');
+console.log('### login.js VERSION 2025-12-31 v4 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,6 +25,17 @@ const chatId = process.env.CHAT_ID;
 const accountsRaw = process.env.ACCOUNTS || '';
 const baseUrl = process.env.BASE_URL || 'https://www.netlib.re/';
 
+function hktTimeString() {
+  const now = new Date();
+  const hk = new Date(now.getTime() + 8 * 60 * 60 * 1000);
+  return hk.toISOString().replace('T', ' ').slice(0, 19) + ' HKT';
+}
+
+function safeName(s) {
+  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+/** Parse ACCOUNTS. Split only on FIRST ":" so password may contain ":" */
 function parseAccounts(raw) {
   const items = raw
     .split(/[,;]/)
@@ -33,7 +44,7 @@ function parseAccounts(raw) {
 
   const list = [];
   for (const item of items) {
-    const idx = item.indexOf(':'); // only split on first colon
+    const idx = item.indexOf(':');
     if (idx === -1) continue;
     const user = item.slice(0, idx).trim();
     const pass = item.slice(idx + 1).trim();
@@ -53,21 +64,25 @@ if (accountList.length === 0) {
   process.exit(1);
 }
 
-function hktTimeString() {
-  const now = new Date();
-  const hk = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  return hk.toISOString().replace('T', ' ').slice(0, 19) + ' HKT';
+function getActionsRunUrl() {
+  const { GITHUB_SERVER_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID } = process.env;
+  if (GITHUB_SERVER_URL && GITHUB_REPOSITORY && GITHUB_RUN_ID) {
+    return `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}`;
+  }
+  return '';
 }
 
 async function sendTelegram(message) {
   if (!token || !chatId) return;
 
-  const fullMessage = `Netlib 登录通知\n\n登录时间：${hktTimeString()}\n\n${message}`;
+  // Telegram message limit ~4096 chars. Keep some buffer.
+  const maxLen = 3800;
+  const text = message.length > maxLen ? message.slice(0, maxLen) + '\n\n...(truncated)' : message;
 
   try {
     await axios.post(
       `https://api.telegram.org/bot${token}/sendMessage`,
-      { chat_id: chatId, text: fullMessage },
+      { chat_id: chatId, text },
       { timeout: 10000 }
     );
     console.log('✅ Telegram 通知发送成功');
@@ -76,7 +91,10 @@ async function sendTelegram(message) {
   }
 }
 
-// --- 判定函数：避免 Logs 污染 ---
+/**
+ * Detect top "Invalid credentials" banner.
+ * We distinguish it from Logs area by checking element y position near top.
+ */
 async function hasTopInvalidBanner(page) {
   const loc = page.getByText(/Invalid credentials\.?/i);
   const n = await loc.count();
@@ -91,22 +109,26 @@ async function hasTopInvalidBanner(page) {
     if (box && typeof box.y === 'number') minY = Math.min(minY, box.y);
   }
 
-  // 顶部红条一般在页面上方；Logs 在更下方
-  return minY < 200;
+  // headless/layout variance: use 400px threshold
+  return minY < 400;
 }
 
-async function hasSuccessOwnerText(page) {
+/**
+ * Success signals: either "My domains" heading or owner text appears.
+ * No y-threshold to avoid false negatives on different viewport heights.
+ */
+async function getSuccessSignals(page) {
+  const myDomains = page.getByText(/^My domains$/i);
   const ownerText = page.getByText(/You are the exclusive owner of the following domains\./i);
-  const visible = await ownerText.first().isVisible().catch(() => false);
-  if (!visible) return false;
 
-  const box = await ownerText.first().boundingBox().catch(() => null);
-  // 成功页该文案在较上方区域；加个位置限制，避免极端误匹配
-  return !!box && box.y < 800;
-}
+  const hasMyDomains = await myDomains.first().isVisible().catch(() => false);
+  const hasOwnerText = await ownerText.first().isVisible().catch(() => false);
 
-function safeName(s) {
-  return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return {
+    hasMyDomains,
+    hasOwnerText,
+    success: hasMyDomains || hasOwnerText
+  };
 }
 
 async function loginWithAccount(user, pass) {
@@ -117,14 +139,28 @@ async function loginWithAccount(user, pass) {
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
-  const context = await browser.newContext();
+  const context = await browser.newContext({
+    viewport: { width: 1400, height: 900 } // 稍大点，减少布局差异
+  });
+
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
 
-  const result = { user, success: false, message: '' };
+  const result = {
+    user,
+    success: false,
+    status: 'INIT', // SUCCESS | FAIL_INVALID | FAIL_UNKNOWN | ERROR
+    reason: '',
+    url: '',
+    title: '',
+    topInvalid: false,
+    hasMyDomains: false,
+    hasOwnerText: false,
+    screenshot: ''
+  };
 
   try {
-    // 避免复用旧 token / storage 造成“错密码仍像成功”
+    // avoid reused storage/token affecting state
     await page.addInitScript(() => {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
@@ -133,15 +169,16 @@ async function loginWithAccount(user, pass) {
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
 
     console.log(`🔑 ${user} - 点击 Login...`);
-    // 你截图里是导航栏 link
+    // your screenshot shows nav link
     const loginLink = page.getByRole('link', { name: /^login$/i });
     if (await loginLink.count()) {
-      await loginLink.first().click();
+      await loginLink.first().click({ timeout: 10000 });
     } else {
-      await page.getByText(/^login$/i).click();
+      // fallback
+      await page.getByText(/^login$/i).first().click({ timeout: 10000 });
     }
 
-    // 等待表单出现
+    // wait for auth form
     await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 15000 });
 
     console.log(`📝 ${user} - 填写用户名...`);
@@ -153,40 +190,55 @@ async function loginWithAccount(user, pass) {
     console.log(`📤 ${user} - 提交登录(Validate)...`);
     await page.getByRole('button', { name: /^validate$/i }).click();
 
-    // 等待 15 秒内出现“顶部错误”或“成功文案”
+    // wait for either fail or success signal (up to 30s)
     const t0 = Date.now();
-    while (Date.now() - t0 < 15000) {
+    while (Date.now() - t0 < 30000) {
       const topInvalid = await hasTopInvalidBanner(page);
-      const success = await hasSuccessOwnerText(page);
-      if (topInvalid || success) break;
-      await page.waitForTimeout(250);
+      const sig = await getSuccessSignals(page);
+      if (topInvalid || sig.success) break;
+      await page.waitForTimeout(300);
     }
 
-    const topInvalid = await hasTopInvalidBanner(page);
-    const success = await hasSuccessOwnerText(page);
+    result.url = page.url();
+    result.title = await page.title().catch(() => '');
 
-    console.log(`🔍 ${user} - 判定: topInvalid=${topInvalid}, successOwnerText=${success}`);
+    result.topInvalid = await hasTopInvalidBanner(page);
+    const sig = await getSuccessSignals(page);
+    result.hasMyDomains = sig.hasMyDomains;
+    result.hasOwnerText = sig.hasOwnerText;
 
-    // 失败永远优先
-    if (topInvalid) {
+    console.log(
+      `🔍 ${user} - 判定: topInvalid=${result.topInvalid}, hasMyDomains=${result.hasMyDomains}, hasOwnerText=${result.hasOwnerText}, url=${result.url}`
+    );
+
+    if (result.topInvalid) {
+      result.status = 'FAIL_INVALID';
+      result.reason = '账号或密码错误（顶部出现 Invalid credentials）';
       result.success = false;
-      result.message = `❌ ${user} 登录失败: 账号或密码错误`;
-      await page.screenshot({ path: path.join(__dirname, `fail_${safeName(user)}.png`), fullPage: true }).catch(() => {});
-      console.log(`❌ ${user} - 登录失败`);
-    } else if (success) {
+      result.screenshot = `fail_${safeName(user)}.png`;
+      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      console.log(`❌ ${user} - 登录失败（密码错误）`);
+    } else if (sig.success) {
+      result.status = 'SUCCESS';
+      result.reason = result.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...';
       result.success = true;
-      result.message = `✅ ${user} 登录成功`;
       console.log(`✅ ${user} - 登录成功`);
     } else {
+      result.status = 'FAIL_UNKNOWN';
+      result.reason = '未检测到成功标识(My domains/owner文案)或顶部错误条（可能页面变更/加载慢/点击未生效/网络问题）';
       result.success = false;
-      result.message = `❌ ${user} 登录失败: 未检测到成功/失败标识（已截图）`;
-      await page.screenshot({ path: path.join(__dirname, `unknown_${safeName(user)}.png`), fullPage: true }).catch(() => {});
-      console.log(`❌ ${user} - 登录结果不明确（已截图）`);
+      result.screenshot = `unknown_${safeName(user)}.png`;
+      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      console.log(`❌ ${user} - 登录失败（未判定，已截图）`);
     }
   } catch (e) {
+    result.status = 'ERROR';
     result.success = false;
-    result.message = `❌ ${user} 登录异常: ${e?.message || e}`;
-    await page.screenshot({ path: path.join(__dirname, `error_${safeName(user)}.png`), fullPage: true }).catch(() => {});
+    result.reason = `脚本异常: ${e?.message || e}`;
+    result.url = page?.url?.() || '';
+    result.title = await page?.title?.().catch(() => '') || '';
+    result.screenshot = `error_${safeName(user)}.png`;
+    await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
     console.log(`❌ ${user} - 登录异常: ${e?.message || e}`);
   } finally {
     await page.close().catch(() => {});
@@ -195,6 +247,27 @@ async function loginWithAccount(user, pass) {
   }
 
   return result;
+}
+
+function formatResultLine(r) {
+  const statusZh = {
+    SUCCESS: '成功',
+    FAIL_INVALID: '失败-密码错误',
+    FAIL_UNKNOWN: '失败-未判定',
+    ERROR: '异常'
+  }[r.status] || r.status;
+
+  let s =
+    `账号：${r.user}\n` +
+    `结果：${statusZh} (${r.status})\n` +
+    `原因：${r.reason}\n` +
+    `证据：topInvalid=${r.topInvalid}, myDomains=${r.hasMyDomains}, ownerText=${r.hasOwnerText}\n`;
+
+  if (r.title) s += `Title：${r.title}\n`;
+  if (r.url) s += `URL：${r.url}\n`;
+  if (r.screenshot) s += `截图：${r.screenshot}（Actions artifact 下载）\n`;
+
+  return s;
 }
 
 async function main() {
@@ -215,13 +288,25 @@ async function main() {
     }
   }
 
-  const successCount = results.filter(r => r.success).length;
-  const totalCount = results.length;
+  const counts = results.reduce((acc, r) => {
+    acc[r.status] = (acc[r.status] || 0) + 1;
+    return acc;
+  }, {});
 
-  let summary = `📊 登录汇总: ${successCount}/${totalCount} 个账号成功\n\n`;
-  for (const r of results) summary += `${r.message}\n`;
+  const runUrl = getActionsRunUrl();
 
-  await sendTelegram(summary);
+  let msg =
+    `Netlib 登录通知\n` +
+    `时间：${hktTimeString()}\n` +
+    (runUrl ? `Run：${runUrl}\n` : '') +
+    `\n` +
+    `汇总：成功 ${counts.SUCCESS || 0}；密码错误 ${counts.FAIL_INVALID || 0}；未判定 ${counts.FAIL_UNKNOWN || 0}；异常 ${counts.ERROR || 0}\n\n`;
+
+  for (const r of results) {
+    msg += formatResultLine(r) + '\n';
+  }
+
+  await sendTelegram(msg);
 
   console.log('\n✅ 所有账号处理完成！');
 }
