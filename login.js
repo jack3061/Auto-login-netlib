@@ -1,6 +1,6 @@
 /**
  * Netlib auto login (robust)
- * VERSION: 2025-12-31 v4
+ * VERSION: 2025-12-31 v5
  *
  * Env:
  *  - ACCOUNTS="user1:pass1,user2:pass2"   (comma or semicolon separated)
@@ -13,8 +13,9 @@ import axios from 'axios';
 import { chromium } from 'playwright';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import fs from 'node:fs/promises';
 
-console.log('### login.js VERSION 2025-12-31 v4 ###');
+console.log('### login.js VERSION 2025-12-31 v5 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,7 +36,7 @@ function safeName(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-/** Parse ACCOUNTS. Split only on FIRST ":" so password may contain ":" */
+/** Split only on FIRST ":" so password may contain ":" */
 function parseAccounts(raw) {
   const items = raw
     .split(/[,;]/)
@@ -75,7 +76,7 @@ function getActionsRunUrl() {
 async function sendTelegram(message) {
   if (!token || !chatId) return;
 
-  // Telegram message limit ~4096 chars. Keep some buffer.
+  // Telegram limit ~4096
   const maxLen = 3800;
   const text = message.length > maxLen ? message.slice(0, maxLen) + '\n\n...(truncated)' : message;
 
@@ -91,11 +92,16 @@ async function sendTelegram(message) {
   }
 }
 
-/**
- * Detect top "Invalid credentials" banner.
- * We distinguish it from Logs area by checking element y position near top.
- */
+/** Try to detect the TOP red banner, not the Logs entry */
 async function hasTopInvalidBanner(page) {
+  // Prefer bootstrap-like alerts if present
+  const alertLoc = page.locator(
+    '.alert, .alert-danger, .notification, .toast, .snackbar'
+  ).filter({ hasText: /Invalid credentials/i });
+
+  if (await alertLoc.first().isVisible().catch(() => false)) return true;
+
+  // Fallback: distinguish by y position
   const loc = page.getByText(/Invalid credentials\.?/i);
   const n = await loc.count();
   let minY = Infinity;
@@ -104,31 +110,53 @@ async function hasTopInvalidBanner(page) {
     const item = loc.nth(i);
     const visible = await item.isVisible().catch(() => false);
     if (!visible) continue;
-
     const box = await item.boundingBox().catch(() => null);
     if (box && typeof box.y === 'number') minY = Math.min(minY, box.y);
   }
 
-  // headless/layout variance: use 400px threshold
-  return minY < 400;
+  return minY < 450; // relaxed threshold for headless layout
+}
+
+async function getSuccessSignalsUI(page) {
+  const myDomainsHeading = page.getByRole('heading', { name: /my domains/i });
+  const myDomainsText = page.getByText(/my domains/i);
+  const ownerText = page.getByText(/You are the exclusive owner of the following domains\./i);
+
+  const hasHeading = await myDomainsHeading.first().isVisible().catch(() => false);
+  const hasMyDomains = hasHeading || (await myDomainsText.first().isVisible().catch(() => false));
+  const hasOwnerText = await ownerText.first().isVisible().catch(() => false);
+
+  return { hasMyDomains, hasOwnerText, success: hasMyDomains || hasOwnerText };
 }
 
 /**
- * Success signals: either "My domains" heading or owner text appears.
- * No y-threshold to avoid false negatives on different viewport heights.
+ * Parse Logs from body.innerText, but ONLY after the LAST
+ * "System: authenticate (login: user)" occurrence.
  */
-async function getSuccessSignals(page) {
-  const myDomains = page.getByText(/^My domains$/i);
-  const ownerText = page.getByText(/You are the exclusive owner of the following domains\./i);
+async function getLoginVerdictFromLogs(page, user) {
+  const bodyText = await page.evaluate(() => document.body?.innerText || '');
+  const anchor = `authenticate (login: ${user})`;
+  const idx = bodyText.lastIndexOf(anchor);
+  if (idx === -1) return { verdict: 'NONE', snippet: '' };
 
-  const hasMyDomains = await myDomains.first().isVisible().catch(() => false);
-  const hasOwnerText = await ownerText.first().isVisible().catch(() => false);
+  const tail = bodyText.slice(idx);
 
-  return {
-    hasMyDomains,
-    hasOwnerText,
-    success: hasMyDomains || hasOwnerText
-  };
+  // Keep a short snippet for Telegram debugging
+  const lines = tail
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const snippet = lines.slice(0, 25).join('\n'); // first 25 lines after anchor
+
+  const hasInvalid = /Error:\s*Invalid credentials\.?/i.test(tail);
+  const hasAuthd = /Authenticated to authd\./i.test(tail);
+  const hasDns = /Authenticated to dnsmanagerd\./i.test(tail);
+
+  if (hasInvalid) return { verdict: 'FAIL_INVALID', snippet };
+  if (hasAuthd && hasDns) return { verdict: 'SUCCESS', snippet };
+
+  return { verdict: 'UNKNOWN', snippet };
 }
 
 async function loginWithAccount(user, pass) {
@@ -140,7 +168,7 @@ async function loginWithAccount(user, pass) {
   });
 
   const context = await browser.newContext({
-    viewport: { width: 1400, height: 900 } // 稍大点，减少布局差异
+    viewport: { width: 1400, height: 900 }
   });
 
   const page = await context.newPage();
@@ -153,14 +181,18 @@ async function loginWithAccount(user, pass) {
     reason: '',
     url: '',
     title: '',
-    topInvalid: false,
-    hasMyDomains: false,
-    hasOwnerText: false,
+    evidence: {
+      topInvalid: false,
+      uiMyDomains: false,
+      uiOwnerText: false,
+      logsVerdict: 'NONE'
+    },
+    logsSnippet: '',
     screenshot: ''
   };
 
   try {
-    // avoid reused storage/token affecting state
+    // reduce chance of reused storage/token
     await page.addInitScript(() => {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
@@ -169,14 +201,7 @@ async function loginWithAccount(user, pass) {
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
 
     console.log(`🔑 ${user} - 点击 Login...`);
-    // your screenshot shows nav link
-    const loginLink = page.getByRole('link', { name: /^login$/i });
-    if (await loginLink.count()) {
-      await loginLink.first().click({ timeout: 10000 });
-    } else {
-      // fallback
-      await page.getByText(/^login$/i).first().click({ timeout: 10000 });
-    }
+    await page.getByRole('link', { name: /^login$/i }).first().click({ timeout: 10000 });
 
     // wait for auth form
     await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 15000 });
@@ -190,66 +215,101 @@ async function loginWithAccount(user, pass) {
     console.log(`📤 ${user} - 提交登录(Validate)...`);
     await page.getByRole('button', { name: /^validate$/i }).click();
 
-    // wait for either fail or success signal (up to 30s)
+    // Wait up to 30s for any sign (UI fail / UI success / logs anchor line)
+    const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
+
     const t0 = Date.now();
     while (Date.now() - t0 < 30000) {
       const topInvalid = await hasTopInvalidBanner(page);
-      const sig = await getSuccessSignals(page);
-      if (topInvalid || sig.success) break;
+      const ui = await getSuccessSignalsUI(page);
+      const hasAnchor = await anchorLoc.first().isVisible().catch(() => false);
+
+      if (topInvalid || ui.success || hasAnchor) break;
       await page.waitForTimeout(300);
     }
+
+    // Give logs a bit time to append Authenticated/Error after anchor appears
+    await page.waitForTimeout(1500);
 
     result.url = page.url();
     result.title = await page.title().catch(() => '');
 
-    result.topInvalid = await hasTopInvalidBanner(page);
-    const sig = await getSuccessSignals(page);
-    result.hasMyDomains = sig.hasMyDomains;
-    result.hasOwnerText = sig.hasOwnerText;
+    // UI checks
+    result.evidence.topInvalid = await hasTopInvalidBanner(page);
+    const ui = await getSuccessSignalsUI(page);
+    result.evidence.uiMyDomains = ui.hasMyDomains;
+    result.evidence.uiOwnerText = ui.hasOwnerText;
+
+    // Logs-based fallback
+    const logs = await getLoginVerdictFromLogs(page, user);
+    result.evidence.logsVerdict = logs.verdict;
+    result.logsSnippet = logs.snippet;
 
     console.log(
-      `🔍 ${user} - 判定: topInvalid=${result.topInvalid}, hasMyDomains=${result.hasMyDomains}, hasOwnerText=${result.hasOwnerText}, url=${result.url}`
+      `🔍 ${user} - evidence: topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
     );
 
-    if (result.topInvalid) {
+    // Final decision (priority: UI top error > logs invalid > UI success > logs success > unknown)
+    if (result.evidence.topInvalid || logs.verdict === 'FAIL_INVALID') {
       result.status = 'FAIL_INVALID';
-      result.reason = '账号或密码错误（顶部出现 Invalid credentials）';
+      result.reason = result.evidence.topInvalid
+        ? '账号或密码错误（顶部出现 Invalid credentials）'
+        : '账号或密码错误（Logs 出现 Error: Invalid credentials）';
       result.success = false;
+
       result.screenshot = `fail_${safeName(user)}.png`;
       await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
       console.log(`❌ ${user} - 登录失败（密码错误）`);
-    } else if (sig.success) {
-      result.status = 'SUCCESS';
-      result.reason = result.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...';
-      result.success = true;
-      console.log(`✅ ${user} - 登录成功`);
-    } else {
-      result.status = 'FAIL_UNKNOWN';
-      result.reason = '未检测到成功标识(My domains/owner文案)或顶部错误条（可能页面变更/加载慢/点击未生效/网络问题）';
-      result.success = false;
-      result.screenshot = `unknown_${safeName(user)}.png`;
-      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      console.log(`❌ ${user} - 登录失败（未判定，已截图）`);
+      return result;
     }
+
+    if (ui.success || logs.verdict === 'SUCCESS') {
+      result.status = 'SUCCESS';
+      result.reason = ui.success
+        ? (ui.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...')
+        : '检测到成功日志: Authenticated to authd + dnsmanagerd';
+      result.success = true;
+
+      // optional: screenshot on success too (comment out if you don't want)
+      // result.screenshot = `success_${safeName(user)}.png`;
+      // await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
+      console.log(`✅ ${user} - 登录成功`);
+      return result;
+    }
+
+    // Unknown
+    result.status = 'FAIL_UNKNOWN';
+    result.reason = '未能判定：UI 未出现成功/错误条，Logs 也未给出明确 SUCCESS/Invalid（见截图与 logs_*.txt）';
+    result.success = false;
+
+    result.screenshot = `unknown_${safeName(user)}.png`;
+    await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet || '', 'utf8').catch(() => {});
+    console.log(`❌ ${user} - 登录失败（未判定，已截图+保存日志）`);
+    return result;
+
   } catch (e) {
     result.status = 'ERROR';
     result.success = false;
     result.reason = `脚本异常: ${e?.message || e}`;
     result.url = page?.url?.() || '';
     result.title = await page?.title?.().catch(() => '') || '';
+
     result.screenshot = `error_${safeName(user)}.png`;
     await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
     console.log(`❌ ${user} - 登录异常: ${e?.message || e}`);
+    return result;
+
   } finally {
     await page.close().catch(() => {});
     await context.close().catch(() => {});
     await browser.close().catch(() => {});
   }
-
-  return result;
 }
 
-function formatResultLine(r) {
+function formatResultBlock(r) {
   const statusZh = {
     SUCCESS: '成功',
     FAIL_INVALID: '失败-密码错误',
@@ -257,15 +317,23 @@ function formatResultLine(r) {
     ERROR: '异常'
   }[r.status] || r.status;
 
+  const ev = r.evidence || {};
   let s =
     `账号：${r.user}\n` +
     `结果：${statusZh} (${r.status})\n` +
     `原因：${r.reason}\n` +
-    `证据：topInvalid=${r.topInvalid}, myDomains=${r.hasMyDomains}, ownerText=${r.hasOwnerText}\n`;
+    `证据：topInvalid=${!!ev.topInvalid}, uiMyDomains=${!!ev.uiMyDomains}, uiOwnerText=${!!ev.uiOwnerText}, logsVerdict=${ev.logsVerdict}\n`;
 
   if (r.title) s += `Title：${r.title}\n`;
   if (r.url) s += `URL：${r.url}\n`;
-  if (r.screenshot) s += `截图：${r.screenshot}（Actions artifact 下载）\n`;
+  if (r.screenshot) s += `截图：${r.screenshot}\n`;
+  s += `Logs：logs_${safeName(r.user)}.txt\n`;
+
+  // add a small logs preview in telegram (avoid too long)
+  if (r.logsSnippet) {
+    const preview = r.logsSnippet.split('\n').slice(0, 8).join('\n');
+    s += `Logs预览：\n${preview}\n`;
+  }
 
   return s;
 }
@@ -303,11 +371,10 @@ async function main() {
     `汇总：成功 ${counts.SUCCESS || 0}；密码错误 ${counts.FAIL_INVALID || 0}；未判定 ${counts.FAIL_UNKNOWN || 0}；异常 ${counts.ERROR || 0}\n\n`;
 
   for (const r of results) {
-    msg += formatResultLine(r) + '\n';
+    msg += formatResultBlock(r) + '\n';
   }
 
   await sendTelegram(msg);
-
   console.log('\n✅ 所有账号处理完成！');
 }
 
