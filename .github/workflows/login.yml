@@ -2,7 +2,7 @@ name: Netlib Keepalive
 
 on:
   schedule:
-    - cron: '*/2 * * * *'  # 每天运行一次（时间早上8点）
+    - cron: '*/2 * * * *'  # 每天 UTC 0点运行（北京时间早上8点）
   workflow_dispatch:  # 允许手动运行
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
       - name: Install Playwright and browser
         run: npx playwright install --with-deps chromium
 
-      - name: Run lognin script
+      - name: Run login script
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
