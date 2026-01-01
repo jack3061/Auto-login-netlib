@@ -1,15 +1,13 @@
 /**
  * Netlib auto login (robust)
- * VERSION: 2026-01-01 v8 (fix accounts parsing + validate scope)
+ * VERSION: 2026-01-01 v9 (fix SPA routing / avoid /auth 404 + safer login nav)
  *
  * Env:
- *  - ACCOUNTS_JSON='[{"user":"user1","pass":"pass,;: ok"},{"user":"user2","pass":"p2"}]' (RECOMMENDED)
- *  - ACCOUNTS="user1:pass1\nuser2:pass2"  (fallback; newline-separated recommended)
- *    (legacy comma/semicolon supported but NOT recommended if passwords may contain , or ;)
- *  - BOT_TOKEN="xxx" (optional)
- *  - CHAT_ID="xxx"   (optional)
+ *  - ACCOUNTS_JSON='[{"user":"u1","pass":"p,;:"}]' (RECOMMENDED)
+ *  - ACCOUNTS="u1:pass1\nu2:pass2" (fallback; newline recommended)
+ *  - BOT_TOKEN, CHAT_ID (optional)
  *  - BASE_URL="https://www.netlib.re/" (optional)
- *  - DEBUG_ACCOUNTS="1" (optional; prints password length + sha8 fingerprint)
+ *  - DEBUG_ACCOUNTS="1" (optional)
  */
 
 import axios from 'axios';
@@ -19,7 +17,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-console.log('### login.js VERSION 2026-01-01 v8 ###');
+console.log('### login.js VERSION 2026-01-01 v9 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,7 +28,6 @@ const chatId = process.env.CHAT_ID;
 
 const accountsJsonRaw = process.env.ACCOUNTS_JSON || '';
 const accountsRaw = process.env.ACCOUNTS || '';
-
 const baseUrlRaw = process.env.BASE_URL || 'https://www.netlib.re/';
 const debugAccounts = String(process.env.DEBUG_ACCOUNTS || '') === '1';
 
@@ -42,7 +39,6 @@ function normalizeBaseUrl(u) {
     return 'https://www.netlib.re/';
   }
 }
-
 const baseUrl = normalizeBaseUrl(baseUrlRaw);
 
 function hktTimeString() {
@@ -50,18 +46,13 @@ function hktTimeString() {
   const hk = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   return hk.toISOString().replace('T', ' ').slice(0, 19) + ' HKT';
 }
-
 function safeName(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
-
 function sha8(s) {
   return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
 }
 
-/**
- * Preferred: ACCOUNTS_JSON = JSON array [{user, pass}]
- */
 function parseAccountsJson(raw) {
   const arr = JSON.parse(raw);
   if (!Array.isArray(arr)) return [];
@@ -75,9 +66,8 @@ function parseAccountsJson(raw) {
 
 /**
  * Fallback parse:
- * - Recommended format: newline separated: "user:pass\nuser2:pass2"
- * - Legacy support: comma/semicolon separated, BUT unsafe if password contains , or ;
- * Split only on FIRST ":" so password may contain ":".
+ * - recommended: newline separated
+ * - legacy: comma/semicolon (unsafe if password contains , or ;)
  */
 function parseAccounts(raw) {
   const trimmed = String(raw || '').trim();
@@ -85,17 +75,14 @@ function parseAccounts(raw) {
 
   const hasNewline = /[\r\n]/.test(trimmed);
 
-  // Recommended: newline-separated
   let items;
   if (hasNewline) {
     items = trimmed.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   } else {
-    // Legacy: comma/semicolon separated (unsafe)
     items = trimmed.split(/[,;]/).map(s => s.trim()).filter(Boolean);
     if (items.length > 1) {
       console.log(
-        '⚠️ 检测到 ACCOUNTS 使用逗号/分号分隔。若密码包含 , 或 ; 会被截断导致 Invalid credentials。' +
-        ' 建议改用换行分隔或 ACCOUNTS_JSON。'
+        '⚠️ ACCOUNTS 使用逗号/分号分隔；若密码包含 , 或 ; 会被截断导致 Invalid credentials。建议用换行或 ACCOUNTS_JSON。'
       );
     }
   }
@@ -105,8 +92,7 @@ function parseAccounts(raw) {
     const idx = item.indexOf(':');
     if (idx === -1) continue;
     const user = item.slice(0, idx).trim();
-    // IMPORTANT: do not trim password; trailing spaces could be real password
-    const pass = item.slice(idx + 1);
+    const pass = item.slice(idx + 1); // do NOT trim
     if (user && pass !== '') list.push({ user, pass });
   }
   return list;
@@ -162,7 +148,7 @@ function getActionsRunUrl() {
 async function sendTelegram(message) {
   if (!token || !chatId) return;
 
-  const maxLen = 3800; // Telegram limit ~4096
+  const maxLen = 3800;
   const text = message.length > maxLen ? message.slice(0, maxLen) + '\n\n...(truncated)' : message;
 
   try {
@@ -182,14 +168,9 @@ async function isDisconnected(page) {
   return await banner.isVisible().catch(() => false);
 }
 
-/**
- * Wait until the disconnected banner disappears automatically.
- * (Do NOT click reconnect per requirement.)
- */
 async function waitForDisconnectedGone(page, timeoutMs = 30000) {
   const banner = page.getByText(/You have been disconnected/i);
   const t0 = Date.now();
-
   while (Date.now() - t0 < timeoutMs) {
     const visible = await banner.isVisible().catch(() => false);
     if (!visible) return true;
@@ -198,18 +179,12 @@ async function waitForDisconnectedGone(page, timeoutMs = 30000) {
   return false;
 }
 
-/**
- * Readiness gate:
- * 1) Wait until "Read the news!" appears
- * 2) Then wait until disconnected banner auto-disappears
- */
 async function waitForHomeReady(page, timeoutMs = 30000) {
   const readNews = page.getByText(/Read the news!/i);
   await readNews.waitFor({ state: 'visible', timeout: timeoutMs });
   return await waitForDisconnectedGone(page, timeoutMs);
 }
 
-/** Detect top "Invalid credentials" banner (not Logs) */
 async function hasTopInvalidBanner(page) {
   const alertLoc = page
     .locator('.alert, .alert-danger, .notification, .toast, .snackbar')
@@ -217,7 +192,6 @@ async function hasTopInvalidBanner(page) {
 
   if (await alertLoc.first().isVisible().catch(() => false)) return true;
 
-  // Fallback: distinguish by y position
   const loc = page.getByText(/Invalid credentials\.?/i);
   const n = await loc.count();
   let minY = Infinity;
@@ -229,8 +203,6 @@ async function hasTopInvalidBanner(page) {
     const box = await item.boundingBox().catch(() => null);
     if (box && typeof box.y === 'number') minY = Math.min(minY, box.y);
   }
-
-  // Logs area is usually lower; banner is near top
   return minY < 450;
 }
 
@@ -244,10 +216,6 @@ async function getSuccessSignalsUI(page) {
   return { hasMyDomains, hasOwnerText, success: hasMyDomains || hasOwnerText };
 }
 
-/**
- * Parse Logs from body.innerText, but ONLY after the LAST
- * "authenticate (login: user)" occurrence.
- */
 async function getLoginVerdictFromLogs(page, user) {
   const bodyText = await page.evaluate(() => document.body?.innerText || '');
   const anchor = `authenticate (login: ${user})`;
@@ -272,92 +240,101 @@ async function getLoginVerdictFromLogs(page, user) {
   return { verdict: 'UNKNOWN', snippet };
 }
 
-/**
- * Navigate to login page reliably:
- * - Try click (SPA route)
- * - If inputs not visible, try goto on href + common fallbacks
- * - If tabbed UI, click "Authentication" tab
- */
-async function gotoLoginPage(page, baseUrl) {
-  const loginLink = page.getByRole('link', { name: /^login$/i }).first();
-  const href = await loginLink.getAttribute('href').catch(() => null);
+async function isNotFoundPage(page) {
+  const title = await page.title().catch(() => '');
+  if (/404/i.test(title) || /not found/i.test(title)) return true;
 
-  const userInput = page.locator('input[name="username"]');
-
-  // 1) Try click route
-  if (await loginLink.isVisible().catch(() => false)) {
-    await loginLink.scrollIntoViewIfNeeded().catch(() => {});
-    await loginLink.click({ timeout: 10000, force: true }).catch(() => {});
-
-    const authTab = page.getByRole('link', { name: /^authentication$/i });
-    if (await authTab.first().isVisible().catch(() => false)) {
-      await authTab.first().click().catch(() => {});
-    }
-
-    if (await userInput.first().isVisible().catch(() => false)) {
-      return { ok: true, href, tried: 'click(Login)' };
-    }
-  }
-
-  // 2) Try goto fallbacks
-  const candidates = [];
-  if (href) {
-    try { candidates.push(new URL(href, baseUrl).toString()); } catch {}
-  }
-  candidates.push(
-    new URL('/#/authentication', baseUrl).toString(),
-    new URL('/#/login', baseUrl).toString(),
-    new URL('/login', baseUrl).toString(),
-    new URL('/auth', baseUrl).toString()
-  );
-
-  for (const url of [...new Set(candidates)]) {
-    await page.goto(url, { waitUntil: 'domcontentloaded' }).catch(() => {});
-
-    const authTab = page.getByRole('link', { name: /^authentication$/i });
-    if (await authTab.first().isVisible().catch(() => false)) {
-      await authTab.first().click().catch(() => {});
-    }
-
-    if (await userInput.first().isVisible().catch(() => false)) {
-      return { ok: true, href, tried: url };
-    }
-  }
-
-  return { ok: false, href, tried: candidates[0] || '' };
+  const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+  return /darkhttpd/i.test(body) || /The URL you requested was not found/i.test(body);
 }
 
 /**
- * Find the correct Validate button by scoping to the container
- * that contains username/password inputs.
+ * IMPORTANT FIX:
+ * Netlib is an SPA; deep-link paths like /auth may 404 (darkhttpd).
+ * Use hash routing ONLY. Do NOT click tabs that navigate to /auth.
  */
+async function gotoLoginPage(page, baseUrl) {
+  const userInput = page.locator('input[name="username"]').first();
+
+  async function gotoHash(hash) {
+    // ensure we are at origin root
+    await page.goto(baseUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    // set hash without triggering server path navigation
+    await page.evaluate(h => { window.location.hash = h; }, hash).catch(() => {});
+    // Wait a bit for SPA to render
+    await page.waitForTimeout(500);
+
+    // Some SPAs need a reload after hash set (optional)
+    if (await isNotFoundPage(page)) {
+      await page.goto(baseUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+      await page.evaluate(h => { window.location.hash = h; }, hash).catch(() => {});
+      await page.waitForTimeout(600);
+    }
+
+    // If a tab/link "Authentication" exists, ONLY click it when href contains "#"
+    const authTab = page.getByRole('link', { name: /^authentication$/i }).first();
+    if (await authTab.isVisible().catch(() => false)) {
+      const href = await authTab.getAttribute('href').catch(() => '');
+      if (href && href.includes('#')) {
+        await authTab.click().catch(() => {});
+        await page.waitForTimeout(300);
+      } // else: do NOT click (avoid /auth)
+    }
+
+    if (await userInput.isVisible().catch(() => false)) {
+      return { ok: true, tried: `${baseUrl}#${hash}` };
+    }
+    return { ok: false, tried: `${baseUrl}#${hash}` };
+  }
+
+  // Try common hash routes
+  const hashes = ['#/authentication', '#/login', '#/auth', '#/authentication/'];
+  for (const h of hashes) {
+    const r = await gotoHash(h);
+    if (r.ok) return { ok: true, href: '', tried: r.tried };
+  }
+
+  // Last resort: try clicking Login link if present (but avoid non-hash href)
+  const loginLink = page.getByRole('link', { name: /^(login|log in)$/i }).first();
+  if (await loginLink.isVisible().catch(() => false)) {
+    const href = await loginLink.getAttribute('href').catch(() => '');
+    if (href && href.includes('#')) {
+      await loginLink.click({ timeout: 10000, force: true }).catch(() => {});
+      await page.waitForTimeout(500);
+      if (await userInput.isVisible().catch(() => false)) {
+        return { ok: true, href, tried: 'click(Login#)' };
+      }
+    } else {
+      console.log(`⚠️ Login link href=${href || '(null)'} 不含 #，为避免 404(/auth) 已跳过点击。`);
+    }
+  }
+
+  return { ok: false, href: '', tried: `${baseUrl}#/authentication` };
+}
+
 async function clickValidateScoped(page) {
   const userInput = page.locator('input[name="username"]').first();
-  const passInput = page.locator('input[name="password"]').first();
 
-  // Try: nearest form ancestor
   const form = userInput.locator('xpath=ancestor::form[1]');
   const formCount = await form.count().catch(() => 0);
   if (formCount > 0) {
-    const btn = form.getByRole('button', { name: /^validate$/i });
-    if (await btn.first().isVisible().catch(() => false)) {
-      await btn.first().click({ timeout: 15000 });
+    const btn = form.getByRole('button', { name: /^validate$/i }).first();
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.click({ timeout: 15000 });
       return { ok: true, used: 'form->Validate' };
     }
   }
 
-  // Try: common panel/container ancestor (div/section) that also contains password input
   const panel = userInput.locator('xpath=ancestor::*[self::div or self::section or self::main][.//input[@name="password"]][1]');
   const panelCount = await panel.count().catch(() => 0);
   if (panelCount > 0) {
-    const btn = panel.getByRole('button', { name: /^validate$/i });
-    if (await btn.first().isVisible().catch(() => false)) {
-      await btn.first().click({ timeout: 15000 });
+    const btn = panel.getByRole('button', { name: /^validate$/i }).first();
+    if (await btn.isVisible().catch(() => false)) {
+      await btn.click({ timeout: 15000 });
       return { ok: true, used: 'panel->Validate' };
     }
   }
 
-  // Fallback: global (original behavior)
   await page.getByRole('button', { name: /^validate$/i }).first().click({ timeout: 15000 });
   return { ok: true, used: 'global->Validate' };
 }
@@ -380,7 +357,7 @@ async function loginWithAccount(user, pass) {
   const result = {
     user,
     success: false,
-    status: 'INIT', // SUCCESS | FAIL_INVALID | FAIL_UNKNOWN | ERROR
+    status: 'INIT',
     reason: '',
     url: '',
     title: '',
@@ -397,7 +374,6 @@ async function loginWithAccount(user, pass) {
   };
 
   try {
-    // avoid reused storage/token affecting state
     await page.addInitScript(() => {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
@@ -423,36 +399,46 @@ async function loginWithAccount(user, pass) {
       return result;
     }
 
-    console.log(`🔑 ${user} - 打开登录页...`);
+    console.log(`🔑 ${user} - 打开登录页(hash路由)...`);
     const nav = await gotoLoginPage(page, baseUrl);
     result.nav.href = nav.href || '';
     result.nav.tried = nav.tried || '';
-    console.log(`🔗 ${user} - login href=${result.nav.href || '(null)'} ; tried=${result.nav.tried}`);
+    console.log(`🔗 ${user} - tried=${result.nav.tried}`);
 
-    // 登录页也可能短暂断线：按要求只等待它自动消失
     await waitForDisconnectedGone(page, 20000).catch(() => {});
 
-    if (!nav.ok) {
+    // If still NotFound -> fail early with screenshot
+    if (await isNotFoundPage(page)) {
       result.status = 'FAIL_UNKNOWN';
-      result.reason = '无法进入登录页（Login 路由/页面结构可能变化）';
+      result.reason = '进入登录页后落入 404 Not Found（服务器不支持 /auth 这类路径；需使用 #/ 路由）';
       result.url = page.url();
       result.title = await page.title().catch(() => '');
-      result.evidence.disconnected = await isDisconnected(page);
 
       result.screenshot = `no_login_page_${safeName(user)}.png`;
       await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-
       const logs = await getLoginVerdictFromLogs(page, user);
       result.logsSnippet = logs.snippet || '';
       await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
       return result;
     }
 
-    // Ensure inputs visible
     const userInput = page.locator('input[name="username"]').first();
     const passInput = page.locator('input[name="password"]').first();
 
-    await userInput.waitFor({ state: 'visible', timeout: 20000 });
+    if (!(await userInput.isVisible().catch(() => false))) {
+      result.status = 'FAIL_UNKNOWN';
+      result.reason = '无法进入登录页（未找到 username 输入框；页面结构可能变化）';
+      result.url = page.url();
+      result.title = await page.title().catch(() => '');
+
+      result.screenshot = `no_login_page_${safeName(user)}.png`;
+      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      const logs = await getLoginVerdictFromLogs(page, user);
+      result.logsSnippet = logs.snippet || '';
+      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      return result;
+    }
+
     await passInput.waitFor({ state: 'visible', timeout: 20000 });
 
     console.log(`📝 ${user} - 填写用户名...`);
@@ -465,9 +451,7 @@ async function loginWithAccount(user, pass) {
     const clickInfo = await clickValidateScoped(page).catch(e => ({ ok: false, used: `ERROR: ${e?.message || e}` }));
     console.log(`🧭 ${user} - Validate 点击方式: ${clickInfo.used}`);
 
-    // Wait for any sign: top invalid / UI success / logs anchor
     const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
-
     const t0 = Date.now();
     while (Date.now() - t0 < 35000) {
       if (await isDisconnected(page)) {
@@ -482,7 +466,6 @@ async function loginWithAccount(user, pass) {
       await page.waitForTimeout(350);
     }
 
-    // Allow logs to append Authenticated/Error after anchor
     await page.waitForTimeout(2000);
 
     result.url = page.url();
@@ -503,7 +486,6 @@ async function loginWithAccount(user, pass) {
       `🔍 ${user} - evidence: disconnected=${result.evidence.disconnected}, topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
     );
 
-    // Decide (priority: UI top invalid > logs invalid > UI success > logs success > unknown)
     if (result.evidence.topInvalid || logs.verdict === 'FAIL_INVALID') {
       result.status = 'FAIL_INVALID';
       result.reason = result.evidence.topInvalid
