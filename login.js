@@ -1,12 +1,15 @@
 /**
  * Netlib auto login (robust)
- * VERSION: 2025-12-31 v7
+ * VERSION: 2026-01-01 v8 (fix accounts parsing + validate scope)
  *
  * Env:
- *  - ACCOUNTS="user1:pass1,user2:pass2"   (comma or semicolon separated)
+ *  - ACCOUNTS_JSON='[{"user":"user1","pass":"pass,;: ok"},{"user":"user2","pass":"p2"}]' (RECOMMENDED)
+ *  - ACCOUNTS="user1:pass1\nuser2:pass2"  (fallback; newline-separated recommended)
+ *    (legacy comma/semicolon supported but NOT recommended if passwords may contain , or ;)
  *  - BOT_TOKEN="xxx" (optional)
  *  - CHAT_ID="xxx"   (optional)
  *  - BASE_URL="https://www.netlib.re/" (optional)
+ *  - DEBUG_ACCOUNTS="1" (optional; prints password length + sha8 fingerprint)
  */
 
 import axios from 'axios';
@@ -14,8 +17,9 @@ import { chromium } from 'playwright';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 
-console.log('### login.js VERSION 2025-12-31 v7 ###');
+console.log('### login.js VERSION 2026-01-01 v8 ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,8 +27,12 @@ console.log('### FILE PATH:', __filename);
 
 const token = process.env.BOT_TOKEN;
 const chatId = process.env.CHAT_ID;
+
+const accountsJsonRaw = process.env.ACCOUNTS_JSON || '';
 const accountsRaw = process.env.ACCOUNTS || '';
+
 const baseUrlRaw = process.env.BASE_URL || 'https://www.netlib.re/';
+const debugAccounts = String(process.env.DEBUG_ACCOUNTS || '') === '1';
 
 function normalizeBaseUrl(u) {
   try {
@@ -47,33 +55,100 @@ function safeName(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-/** Split only on FIRST ":" so password may contain ":" */
+function sha8(s) {
+  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
+}
+
+/**
+ * Preferred: ACCOUNTS_JSON = JSON array [{user, pass}]
+ */
+function parseAccountsJson(raw) {
+  const arr = JSON.parse(raw);
+  if (!Array.isArray(arr)) return [];
+  return arr
+    .map(x => ({
+      user: x?.user != null ? String(x.user).trim() : '',
+      pass: typeof x?.pass === 'string' ? x.pass : (x?.pass != null ? String(x.pass) : '')
+    }))
+    .filter(x => x.user && x.pass !== '');
+}
+
+/**
+ * Fallback parse:
+ * - Recommended format: newline separated: "user:pass\nuser2:pass2"
+ * - Legacy support: comma/semicolon separated, BUT unsafe if password contains , or ;
+ * Split only on FIRST ":" so password may contain ":".
+ */
 function parseAccounts(raw) {
-  const items = raw
-    .split(/[,;]/)
-    .map(s => s.trim())
-    .filter(Boolean);
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return [];
+
+  const hasNewline = /[\r\n]/.test(trimmed);
+
+  // Recommended: newline-separated
+  let items;
+  if (hasNewline) {
+    items = trimmed.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  } else {
+    // Legacy: comma/semicolon separated (unsafe)
+    items = trimmed.split(/[,;]/).map(s => s.trim()).filter(Boolean);
+    if (items.length > 1) {
+      console.log(
+        '⚠️ 检测到 ACCOUNTS 使用逗号/分号分隔。若密码包含 , 或 ; 会被截断导致 Invalid credentials。' +
+        ' 建议改用换行分隔或 ACCOUNTS_JSON。'
+      );
+    }
+  }
 
   const list = [];
   for (const item of items) {
     const idx = item.indexOf(':');
     if (idx === -1) continue;
     const user = item.slice(0, idx).trim();
-    const pass = item.slice(idx + 1).trim();
-    if (user && pass) list.push({ user, pass });
+    // IMPORTANT: do not trim password; trailing spaces could be real password
+    const pass = item.slice(idx + 1);
+    if (user && pass !== '') list.push({ user, pass });
   }
   return list;
 }
 
-const accountList = parseAccounts(accountsRaw);
+function getAccountList() {
+  if (accountsJsonRaw) {
+    try {
+      const list = parseAccountsJson(accountsJsonRaw);
+      if (list.length) return list;
+      console.log('❌ ACCOUNTS_JSON 解析后为空，请检查 JSON 格式与字段 user/pass');
+      process.exit(1);
+    } catch (e) {
+      console.log(`❌ ACCOUNTS_JSON 不是合法 JSON: ${e?.message || e}`);
+      process.exit(1);
+    }
+  }
 
-if (!accountsRaw) {
-  console.log('❌ 未配置账号: 请设置环境变量 ACCOUNTS');
-  process.exit(1);
+  if (!accountsRaw) {
+    console.log('❌ 未配置账号: 请设置环境变量 ACCOUNTS_JSON 或 ACCOUNTS');
+    process.exit(1);
+  }
+
+  const list = parseAccounts(accountsRaw);
+  if (list.length === 0) {
+    console.log('❌ 账号格式错误，应为：\n  - ACCOUNTS_JSON: [{"user":"u","pass":"p"}]\n  - 或 ACCOUNTS 换行: user:pass\\nuser2:pass2');
+    process.exit(1);
+  }
+  return list;
 }
-if (accountList.length === 0) {
-  console.log('❌ 账号格式错误，应为 username1:password1,username2:password2');
-  process.exit(1);
+
+const accountList = getAccountList();
+
+if (debugAccounts) {
+  console.log('### DEBUG_ACCOUNTS enabled (no plaintext password printed) ###');
+  console.log(
+    accountList.map(a => ({
+      user: a.user,
+      passLen: a.pass.length,
+      passSha8: sha8(a.pass)
+    }))
+  );
 }
 
 function getActionsRunUrl() {
@@ -109,7 +184,7 @@ async function isDisconnected(page) {
 
 /**
  * Wait until the disconnected banner disappears automatically.
- * (Do NOT click reconnect per your requirement.)
+ * (Do NOT click reconnect per requirement.)
  */
 async function waitForDisconnectedGone(page, timeoutMs = 30000) {
   const banner = page.getByText(/You have been disconnected/i);
@@ -124,7 +199,7 @@ async function waitForDisconnectedGone(page, timeoutMs = 30000) {
 }
 
 /**
- * Your required readiness gate:
+ * Readiness gate:
  * 1) Wait until "Read the news!" appears
  * 2) Then wait until disconnected banner auto-disappears
  */
@@ -178,7 +253,6 @@ async function getLoginVerdictFromLogs(page, user) {
   const anchor = `authenticate (login: ${user})`;
   const idx = bodyText.lastIndexOf(anchor);
 
-  // If no anchor, return last lines for debugging
   if (idx === -1) {
     const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
     const tail = lines.slice(-50).join('\n');
@@ -210,7 +284,7 @@ async function gotoLoginPage(page, baseUrl) {
 
   const userInput = page.locator('input[name="username"]');
 
-  // 1) Try click route (after home ready this should work often)
+  // 1) Try click route
   if (await loginLink.isVisible().catch(() => false)) {
     await loginLink.scrollIntoViewIfNeeded().catch(() => {});
     await loginLink.click({ timeout: 10000, force: true }).catch(() => {});
@@ -251,6 +325,41 @@ async function gotoLoginPage(page, baseUrl) {
   }
 
   return { ok: false, href, tried: candidates[0] || '' };
+}
+
+/**
+ * Find the correct Validate button by scoping to the container
+ * that contains username/password inputs.
+ */
+async function clickValidateScoped(page) {
+  const userInput = page.locator('input[name="username"]').first();
+  const passInput = page.locator('input[name="password"]').first();
+
+  // Try: nearest form ancestor
+  const form = userInput.locator('xpath=ancestor::form[1]');
+  const formCount = await form.count().catch(() => 0);
+  if (formCount > 0) {
+    const btn = form.getByRole('button', { name: /^validate$/i });
+    if (await btn.first().isVisible().catch(() => false)) {
+      await btn.first().click({ timeout: 15000 });
+      return { ok: true, used: 'form->Validate' };
+    }
+  }
+
+  // Try: common panel/container ancestor (div/section) that also contains password input
+  const panel = userInput.locator('xpath=ancestor::*[self::div or self::section or self::main][.//input[@name="password"]][1]');
+  const panelCount = await panel.count().catch(() => 0);
+  if (panelCount > 0) {
+    const btn = panel.getByRole('button', { name: /^validate$/i });
+    if (await btn.first().isVisible().catch(() => false)) {
+      await btn.first().click({ timeout: 15000 });
+      return { ok: true, used: 'panel->Validate' };
+    }
+  }
+
+  // Fallback: global (original behavior)
+  await page.getByRole('button', { name: /^validate$/i }).first().click({ timeout: 15000 });
+  return { ok: true, used: 'global->Validate' };
 }
 
 async function loginWithAccount(user, pass) {
@@ -320,7 +429,7 @@ async function loginWithAccount(user, pass) {
     result.nav.tried = nav.tried || '';
     console.log(`🔗 ${user} - login href=${result.nav.href || '(null)'} ; tried=${result.nav.tried}`);
 
-    // 登录页也可能短暂断线：按你的要求只等待它自动消失
+    // 登录页也可能短暂断线：按要求只等待它自动消失
     await waitForDisconnectedGone(page, 20000).catch(() => {});
 
     if (!nav.ok) {
@@ -339,24 +448,28 @@ async function loginWithAccount(user, pass) {
       return result;
     }
 
-    // Ensure inputs are visible
-    await page.locator('input[name="username"]').waitFor({ state: 'visible', timeout: 20000 });
+    // Ensure inputs visible
+    const userInput = page.locator('input[name="username"]').first();
+    const passInput = page.locator('input[name="password"]').first();
+
+    await userInput.waitFor({ state: 'visible', timeout: 20000 });
+    await passInput.waitFor({ state: 'visible', timeout: 20000 });
 
     console.log(`📝 ${user} - 填写用户名...`);
-    await page.locator('input[name="username"]').fill(user);
+    await userInput.fill(user);
 
     console.log(`🔒 ${user} - 填写密码...`);
-    await page.locator('input[name="password"]').fill(pass);
+    await passInput.fill(pass);
 
     console.log(`📤 ${user} - 提交登录(Validate)...`);
-    await page.getByRole('button', { name: /^validate$/i }).click();
+    const clickInfo = await clickValidateScoped(page).catch(e => ({ ok: false, used: `ERROR: ${e?.message || e}` }));
+    console.log(`🧭 ${user} - Validate 点击方式: ${clickInfo.used}`);
 
     // Wait for any sign: top invalid / UI success / logs anchor
     const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
 
     const t0 = Date.now();
     while (Date.now() - t0 < 35000) {
-      // If disconnected shows up, wait it to go away automatically and keep waiting
       if (await isDisconnected(page)) {
         await waitForDisconnectedGone(page, 15000).catch(() => {});
       }
@@ -376,7 +489,6 @@ async function loginWithAccount(user, pass) {
     result.title = await page.title().catch(() => '');
     result.evidence.disconnected = await isDisconnected(page);
 
-    // Evidence
     result.evidence.topInvalid = await hasTopInvalidBanner(page);
     const ui = await getSuccessSignalsUI(page);
     result.evidence.uiMyDomains = ui.hasMyDomains;
