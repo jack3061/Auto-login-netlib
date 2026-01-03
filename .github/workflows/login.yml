@@ -29,12 +29,3 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: npm start
-
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlib-debug
-          path: |
-            *.png
-            logs_*.txt   
