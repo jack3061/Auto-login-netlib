@@ -2,30 +2,58 @@ name: Netlib Keepalive
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天 UTC 0点运行（北京时间早上8点）
-  workflow_dispatch:  # 允许手动运行
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netlib-keepalive-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   auto_login_netlib:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies (ci if lockfile exists)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      - name: Install Playwright and browser
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Install Playwright chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Run login script
+      - name: Run
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: npm start
+
+      - name: Upload package-lock.json (if generated)
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockfile
+          path: package-lock.json
+          if-no-files-found: ignore
+          retention-days: 7
