@@ -1,13 +1,17 @@
 /**
- * Netlib auto login (robust)
- * VERSION: 2026-01-01 v9 (fix SPA routing / avoid /auth 404 + safer login nav)
+ * Netlib auto login (robust for GitHub Actions)
+ * Key fixes:
+ * - Capture console + websocket logs (do NOT rely on document.body.innerText)
+ * - Escape username for RegExp
+ * - Safer artifacts & file naming (avoid overwrite)
  *
  * Env:
- *  - ACCOUNTS_JSON='[{"user":"u1","pass":"p,;:"}]' (RECOMMENDED)
- *  - ACCOUNTS="u1:pass1\nu2:pass2" (fallback; newline recommended)
+ *  - ACCOUNTS_JSON='[{"user":"u1","pass":"p,;:"}]' (recommended)
+ *  - ACCOUNTS="u1:pass1\nu2:pass2" (fallback)
  *  - BOT_TOKEN, CHAT_ID (optional)
  *  - BASE_URL="https://www.netlib.re/" (optional)
  *  - DEBUG_ACCOUNTS="1" (optional)
+ *  - SAVE_ARTIFACTS="1" (optional, default 1 in CI)
  */
 
 import axios from 'axios';
@@ -17,11 +21,10 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 
-console.log('### login.js VERSION 2026-01-01 v9 ###');
+console.log('### login.js (robust) ###');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-console.log('### FILE PATH:', __filename);
 
 const token = process.env.BOT_TOKEN;
 const chatId = process.env.CHAT_ID;
@@ -30,6 +33,9 @@ const accountsJsonRaw = process.env.ACCOUNTS_JSON || '';
 const accountsRaw = process.env.ACCOUNTS || '';
 const baseUrlRaw = process.env.BASE_URL || 'https://www.netlib.re/';
 const debugAccounts = String(process.env.DEBUG_ACCOUNTS || '') === '1';
+const saveArtifacts =
+  String(process.env.SAVE_ARTIFACTS || '') === '1' ||
+  String(process.env.GITHUB_ACTIONS || '') === 'true'; // default on in Actions
 
 function normalizeBaseUrl(u) {
   try {
@@ -46,11 +52,21 @@ function hktTimeString() {
   const hk = new Date(now.getTime() + 8 * 60 * 60 * 1000);
   return hk.toISOString().replace('T', ' ').slice(0, 19) + ' HKT';
 }
+
 function safeName(s) {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
+
 function sha8(s) {
   return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
+}
+
+function fileTag(user) {
+  return `${safeName(user)}_${sha8(user)}`;
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function parseAccountsJson(raw) {
@@ -82,7 +98,7 @@ function parseAccounts(raw) {
     items = trimmed.split(/[,;]/).map(s => s.trim()).filter(Boolean);
     if (items.length > 1) {
       console.log(
-        '⚠️ ACCOUNTS 使用逗号/分号分隔；若密码包含 , 或 ; 会被截断导致 Invalid credentials。建议用换行或 ACCOUNTS_JSON。'
+        'WARN: ACCOUNTS 使用逗号/分号分隔；若密码包含 , 或 ; 会被截断。建议用换行或 ACCOUNTS_JSON。'
       );
     }
   }
@@ -103,22 +119,26 @@ function getAccountList() {
     try {
       const list = parseAccountsJson(accountsJsonRaw);
       if (list.length) return list;
-      console.log('❌ ACCOUNTS_JSON 解析后为空，请检查 JSON 格式与字段 user/pass');
+      console.log('ERROR: ACCOUNTS_JSON 解析后为空，请检查 JSON 格式与字段 user/pass');
       process.exit(1);
     } catch (e) {
-      console.log(`❌ ACCOUNTS_JSON 不是合法 JSON: ${e?.message || e}`);
+      console.log(`ERROR: ACCOUNTS_JSON 不是合法 JSON: ${e?.message || e}`);
       process.exit(1);
     }
   }
 
   if (!accountsRaw) {
-    console.log('❌ 未配置账号: 请设置环境变量 ACCOUNTS_JSON 或 ACCOUNTS');
+    console.log('ERROR: 未配置账号: 请设置环境变量 ACCOUNTS_JSON 或 ACCOUNTS');
     process.exit(1);
   }
 
   const list = parseAccounts(accountsRaw);
   if (list.length === 0) {
-    console.log('❌ 账号格式错误，应为：\n  - ACCOUNTS_JSON: [{"user":"u","pass":"p"}]\n  - 或 ACCOUNTS 换行: user:pass\\nuser2:pass2');
+    console.log(
+      'ERROR: 账号格式错误，应为：\n' +
+      '  - ACCOUNTS_JSON: [{"user":"u","pass":"p"}]\n' +
+      '  - 或 ACCOUNTS 换行: user:pass\\nuser2:pass2'
+    );
     process.exit(1);
   }
   return list;
@@ -157,9 +177,9 @@ async function sendTelegram(message) {
       { chat_id: chatId, text },
       { timeout: 10000 }
     );
-    console.log('✅ Telegram 通知发送成功');
+    console.log('INFO: Telegram 通知发送成功');
   } catch (e) {
-    console.log(`⚠️ Telegram 发送失败: ${e?.message || e}`);
+    console.log(`WARN: Telegram 发送失败: ${e?.message || e}`);
   }
 }
 
@@ -179,10 +199,30 @@ async function waitForDisconnectedGone(page, timeoutMs = 30000) {
   return false;
 }
 
-async function waitForHomeReady(page, timeoutMs = 30000) {
+/**
+ * Home readiness: do NOT hard-depend on one slogan.
+ * We'll try several signals; if none appear, still continue (SPA may change copy).
+ */
+async function waitForHomeReady(page, timeoutMs = 40000) {
+  const t0 = Date.now();
+
+  // try known text
   const readNews = page.getByText(/Read the news!/i);
-  await readNews.waitFor({ state: 'visible', timeout: timeoutMs });
-  return await waitForDisconnectedGone(page, timeoutMs);
+  // or any top-level nav links that usually exist
+  const anyNav = page.getByRole('link').first();
+
+  while (Date.now() - t0 < timeoutMs) {
+    if (await isDisconnected(page)) {
+      await waitForDisconnectedGone(page, 20000).catch(() => {});
+    }
+
+    const ok1 = await readNews.isVisible().catch(() => false);
+    const ok2 = await anyNav.isVisible().catch(() => false);
+
+    if (ok1 || ok2) return true;
+    await page.waitForTimeout(350);
+  }
+  return !(await isDisconnected(page));
 }
 
 async function hasTopInvalidBanner(page) {
@@ -193,7 +233,7 @@ async function hasTopInvalidBanner(page) {
   if (await alertLoc.first().isVisible().catch(() => false)) return true;
 
   const loc = page.getByText(/Invalid credentials\.?/i);
-  const n = await loc.count();
+  const n = await loc.count().catch(() => 0);
   let minY = Infinity;
 
   for (let i = 0; i < n; i++) {
@@ -207,8 +247,9 @@ async function hasTopInvalidBanner(page) {
 }
 
 async function getSuccessSignalsUI(page) {
+  // UI signals are best-effort only
   const myDomainsHeading = page.getByRole('heading', { name: /my domains/i });
-  const ownerText = page.getByText(/You are the exclusive owner of the following domains\./i);
+  const ownerText = page.getByText(/exclusive owner of the following domains/i);
 
   const hasMyDomains = await myDomainsHeading.first().isVisible().catch(() => false);
   const hasOwnerText = await ownerText.first().isVisible().catch(() => false);
@@ -216,28 +257,16 @@ async function getSuccessSignalsUI(page) {
   return { hasMyDomains, hasOwnerText, success: hasMyDomains || hasOwnerText };
 }
 
-async function getLoginVerdictFromLogs(page, user) {
-  const bodyText = await page.evaluate(() => document.body?.innerText || '');
-  const anchor = `authenticate (login: ${user})`;
-  const idx = bodyText.lastIndexOf(anchor);
+function getLoginVerdictFromText(allText) {
+  const text = String(allText || '');
 
-  if (idx === -1) {
-    const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-    const tail = lines.slice(-50).join('\n');
-    return { verdict: 'NONE', snippet: tail };
-  }
+  const hasInvalid = /Invalid credentials\.?/i.test(text);
+  const hasAuthd = /Authenticated to authd\./i.test(text);
+  const hasDns = /Authenticated to dnsmanagerd\./i.test(text);
 
-  const tail = bodyText.slice(idx);
-  const lines = tail.split('\n').map(l => l.trim()).filter(Boolean);
-  const snippet = lines.slice(0, 35).join('\n');
-
-  const hasInvalid = /Error:\s*Invalid credentials\.?/i.test(tail);
-  const hasAuthd = /Authenticated to authd\./i.test(tail);
-  const hasDns = /Authenticated to dnsmanagerd\./i.test(tail);
-
-  if (hasInvalid) return { verdict: 'FAIL_INVALID', snippet };
-  if (hasAuthd && hasDns) return { verdict: 'SUCCESS', snippet };
-  return { verdict: 'UNKNOWN', snippet };
+  if (hasInvalid) return { verdict: 'FAIL_INVALID', snippet: text.slice(-4000) };
+  if (hasAuthd && hasDns) return { verdict: 'SUCCESS', snippet: text.slice(-4000) };
+  return { verdict: 'UNKNOWN', snippet: text.slice(-4000) };
 }
 
 async function isNotFoundPage(page) {
@@ -249,63 +278,57 @@ async function isNotFoundPage(page) {
 }
 
 /**
- * IMPORTANT FIX:
- * Netlib is an SPA; deep-link paths like /auth may 404 (darkhttpd).
- * Use hash routing ONLY. Do NOT click tabs that navigate to /auth.
+ * Netlib is an SPA; avoid server deep-link like /auth (may 404).
+ * Use hash routing ONLY.
  */
 async function gotoLoginPage(page, baseUrl) {
   const userInput = page.locator('input[name="username"]').first();
 
-  async function gotoHash(hash) {
-    // ensure we are at origin root
+  async function gotoHash(hashValueWithLeadingHash) {
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    // set hash without triggering server path navigation
-    await page.evaluate(h => { window.location.hash = h; }, hash).catch(() => {});
-    // Wait a bit for SPA to render
-    await page.waitForTimeout(500);
+    await page.evaluate(h => { window.location.hash = h; }, hashValueWithLeadingHash).catch(() => {});
+    await page.waitForTimeout(600);
 
-    // Some SPAs need a reload after hash set (optional)
     if (await isNotFoundPage(page)) {
       await page.goto(baseUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-      await page.evaluate(h => { window.location.hash = h; }, hash).catch(() => {});
-      await page.waitForTimeout(600);
+      await page.evaluate(h => { window.location.hash = h; }, hashValueWithLeadingHash).catch(() => {});
+      await page.waitForTimeout(800);
     }
 
-    // If a tab/link "Authentication" exists, ONLY click it when href contains "#"
+    // Only click Authentication tab if it's hash-based
     const authTab = page.getByRole('link', { name: /^authentication$/i }).first();
     if (await authTab.isVisible().catch(() => false)) {
       const href = await authTab.getAttribute('href').catch(() => '');
       if (href && href.includes('#')) {
         await authTab.click().catch(() => {});
         await page.waitForTimeout(300);
-      } // else: do NOT click (avoid /auth)
+      }
     }
 
     if (await userInput.isVisible().catch(() => false)) {
-      return { ok: true, tried: `${baseUrl}#${hash}` };
+      return { ok: true, tried: `${baseUrl}${hashValueWithLeadingHash}` };
     }
-    return { ok: false, tried: `${baseUrl}#${hash}` };
+    return { ok: false, tried: `${baseUrl}${hashValueWithLeadingHash}` };
   }
 
-  // Try common hash routes
   const hashes = ['#/authentication', '#/login', '#/auth', '#/authentication/'];
   for (const h of hashes) {
     const r = await gotoHash(h);
     if (r.ok) return { ok: true, href: '', tried: r.tried };
   }
 
-  // Last resort: try clicking Login link if present (but avoid non-hash href)
+  // Last resort: click Login link only if hash-based
   const loginLink = page.getByRole('link', { name: /^(login|log in)$/i }).first();
   if (await loginLink.isVisible().catch(() => false)) {
     const href = await loginLink.getAttribute('href').catch(() => '');
     if (href && href.includes('#')) {
       await loginLink.click({ timeout: 10000, force: true }).catch(() => {});
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(600);
       if (await userInput.isVisible().catch(() => false)) {
         return { ok: true, href, tried: 'click(Login#)' };
       }
     } else {
-      console.log(`⚠️ Login link href=${href || '(null)'} 不含 #，为避免 404(/auth) 已跳过点击。`);
+      console.log(`WARN: Login link href=${href || '(null)'} 不含 #，为避免 404 已跳过点击。`);
     }
   }
 
@@ -325,7 +348,9 @@ async function clickValidateScoped(page) {
     }
   }
 
-  const panel = userInput.locator('xpath=ancestor::*[self::div or self::section or self::main][.//input[@name="password"]][1]');
+  const panel = userInput.locator(
+    'xpath=ancestor::*[self::div or self::section or self::main][.//input[@name="password"]][1]'
+  );
   const panelCount = await panel.count().catch(() => 0);
   if (panelCount > 0) {
     const btn = panel.getByRole('button', { name: /^validate$/i }).first();
@@ -339,8 +364,18 @@ async function clickValidateScoped(page) {
   return { ok: true, used: 'global->Validate' };
 }
 
+async function maybeWriteFile(relName, content) {
+  if (!saveArtifacts) return;
+  await fs.writeFile(path.join(__dirname, relName), content, 'utf8').catch(() => {});
+}
+
+async function maybeScreenshot(page, relName) {
+  if (!saveArtifacts) return;
+  await page.screenshot({ path: path.join(__dirname, relName), fullPage: true }).catch(() => {});
+}
+
 async function loginWithAccount(user, pass) {
-  console.log(`\n🚀 开始登录账号: ${user}`);
+  console.log(`\nSTART login: ${user}`);
 
   const browser = await chromium.launch({
     headless: true,
@@ -353,6 +388,27 @@ async function loginWithAccount(user, pass) {
 
   const page = await context.newPage();
   page.setDefaultTimeout(30000);
+
+  // ---- capture console + websocket logs (critical for correct verdict) ----
+  const runtimeLogs = [];
+  function pushLog(line) {
+    if (!line) return;
+    runtimeLogs.push(String(line));
+    if (runtimeLogs.length > 2500) runtimeLogs.shift();
+  }
+
+  page.on('console', msg => pushLog(`[console:${msg.type()}] ${msg.text()}`));
+  page.on('pageerror', err => pushLog(`[pageerror] ${err?.message || err}`));
+  page.on('requestfailed', req => pushLog(`[requestfailed] ${req.method()} ${req.url()} ${req.failure()?.errorText || ''}`));
+
+  page.on('websocket', ws => {
+    pushLog(`[ws] opened ${ws.url()}`);
+    ws.on('framereceived', f => pushLog(`[ws<-] ${f.payload}`));
+    ws.on('framesent', f => pushLog(`[ws->] ${f.payload}`));
+    ws.on('close', () => pushLog(`[ws] closed ${ws.url()}`));
+  });
+
+  const tag = fileTag(user);
 
   const result = {
     user,
@@ -367,7 +423,7 @@ async function loginWithAccount(user, pass) {
       topInvalid: false,
       uiMyDomains: false,
       uiOwnerText: false,
-      logsVerdict: 'NONE'
+      logsVerdict: 'UNKNOWN'
     },
     logsSnippet: '',
     screenshot: ''
@@ -378,47 +434,44 @@ async function loginWithAccount(user, pass) {
       try { localStorage.clear(); sessionStorage.clear(); } catch {}
     });
 
-    console.log(`📱 ${user} - 访问首页...`);
+    console.log(`${user} goto home...`);
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
 
-    console.log(`⏳ ${user} - 等待首页就绪(Read the news!) 且断线提示自动消失...`);
-    const ready = await waitForHomeReady(page, 40000);
+    console.log(`${user} wait home ready + disconnected gone...`);
+    const ready = await waitForHomeReady(page, 45000);
     if (!ready) {
       result.status = 'FAIL_UNKNOWN';
-      result.reason = '首页断线提示未自动消失（WebSocket不稳定/Actions网络问题）';
+      result.reason = '首页长期处于 disconnected/未就绪（网络或 WS 不稳定）';
       result.url = page.url();
       result.title = await page.title().catch(() => '');
       result.evidence.disconnected = await isDisconnected(page);
 
-      result.screenshot = `disconnected_${safeName(user)}.png`;
-      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-
-      const logs = await getLoginVerdictFromLogs(page, user);
+      result.screenshot = `disconnected_${tag}.png`;
+      await maybeScreenshot(page, result.screenshot);
+      const logs = getLoginVerdictFromText(runtimeLogs.join('\n'));
+      result.evidence.logsVerdict = logs.verdict;
       result.logsSnippet = logs.snippet || '';
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      await maybeWriteFile(`runtime_${tag}.txt`, runtimeLogs.join('\n'));
       return result;
     }
 
-    console.log(`🔑 ${user} - 打开登录页(hash路由)...`);
+    console.log(`${user} open login page (hash route)...`);
     const nav = await gotoLoginPage(page, baseUrl);
     result.nav.href = nav.href || '';
     result.nav.tried = nav.tried || '';
-    console.log(`🔗 ${user} - tried=${result.nav.tried}`);
+    console.log(`${user} tried=${result.nav.tried}`);
 
     await waitForDisconnectedGone(page, 20000).catch(() => {});
 
-    // If still NotFound -> fail early with screenshot
     if (await isNotFoundPage(page)) {
       result.status = 'FAIL_UNKNOWN';
-      result.reason = '进入登录页后落入 404 Not Found（服务器不支持 /auth 这类路径；需使用 #/ 路由）';
+      result.reason = '进入登录页后落入 404（SPA 必须用 #/ 路由）';
       result.url = page.url();
       result.title = await page.title().catch(() => '');
 
-      result.screenshot = `no_login_page_${safeName(user)}.png`;
-      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      const logs = await getLoginVerdictFromLogs(page, user);
-      result.logsSnippet = logs.snippet || '';
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      result.screenshot = `no_login_page_${tag}.png`;
+      await maybeScreenshot(page, result.screenshot);
+      await maybeWriteFile(`runtime_${tag}.txt`, runtimeLogs.join('\n'));
       return result;
     }
 
@@ -427,46 +480,53 @@ async function loginWithAccount(user, pass) {
 
     if (!(await userInput.isVisible().catch(() => false))) {
       result.status = 'FAIL_UNKNOWN';
-      result.reason = '无法进入登录页（未找到 username 输入框；页面结构可能变化）';
+      result.reason = '未找到 username 输入框（页面结构变化或未进入登录视图）';
       result.url = page.url();
       result.title = await page.title().catch(() => '');
 
-      result.screenshot = `no_login_page_${safeName(user)}.png`;
-      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
-      const logs = await getLoginVerdictFromLogs(page, user);
-      result.logsSnippet = logs.snippet || '';
-      await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+      result.screenshot = `no_login_ui_${tag}.png`;
+      await maybeScreenshot(page, result.screenshot);
+      await maybeWriteFile(`runtime_${tag}.txt`, runtimeLogs.join('\n'));
       return result;
     }
 
     await passInput.waitFor({ state: 'visible', timeout: 20000 });
 
-    console.log(`📝 ${user} - 填写用户名...`);
     await userInput.fill(user);
-
-    console.log(`🔒 ${user} - 填写密码...`);
     await passInput.fill(pass);
 
-    console.log(`📤 ${user} - 提交登录(Validate)...`);
     const clickInfo = await clickValidateScoped(page).catch(e => ({ ok: false, used: `ERROR: ${e?.message || e}` }));
-    console.log(`🧭 ${user} - Validate 点击方式: ${clickInfo.used}`);
+    console.log(`${user} Validate click=${clickInfo.used}`);
 
-    const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${user}\\)`, 'i'));
+    // DO NOT embed raw user into regex without escaping
+    const anchorLoc = page.getByText(new RegExp(`authenticate \\(login: ${escapeRegExp(user)}\\)`, 'i'));
+
     const t0 = Date.now();
-    while (Date.now() - t0 < 35000) {
+    while (Date.now() - t0 < 45000) {
       if (await isDisconnected(page)) {
         await waitForDisconnectedGone(page, 15000).catch(() => {});
       }
 
-      const topInvalid = await hasTopInvalidBanner(page);
-      const ui = await getSuccessSignalsUI(page);
-      const hasAnchor = await anchorLoc.first().isVisible().catch(() => false);
+      // Prefer log-based verdict (most reliable in SPA+WS)
+      const logsNow = getLoginVerdictFromText(runtimeLogs.join('\n'));
+      if (logsNow.verdict === 'FAIL_INVALID' || logsNow.verdict === 'SUCCESS') break;
 
-      if (topInvalid || ui.success || hasAnchor) break;
+      const topInvalid = await hasTopInvalidBanner(page);
+      if (topInvalid) break;
+
+      const ui = await getSuccessSignalsUI(page);
+      if (ui.success) break;
+
+      const hasAnchor = await anchorLoc.first().isVisible().catch(() => false);
+      if (hasAnchor) {
+        // anchor is a weak signal; still allow loop to end
+        break;
+      }
+
       await page.waitForTimeout(350);
     }
 
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1200);
 
     result.url = page.url();
     result.title = await page.title().catch(() => '');
@@ -477,44 +537,42 @@ async function loginWithAccount(user, pass) {
     result.evidence.uiMyDomains = ui.hasMyDomains;
     result.evidence.uiOwnerText = ui.hasOwnerText;
 
-    const logs = await getLoginVerdictFromLogs(page, user);
+    const logs = getLoginVerdictFromText(runtimeLogs.join('\n'));
     result.evidence.logsVerdict = logs.verdict;
     result.logsSnippet = logs.snippet || '';
-    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
 
-    console.log(
-      `🔍 ${user} - evidence: disconnected=${result.evidence.disconnected}, topInvalid=${result.evidence.topInvalid}, uiMyDomains=${result.evidence.uiMyDomains}, uiOwnerText=${result.evidence.uiOwnerText}, logsVerdict=${result.evidence.logsVerdict}, url=${result.url}`
-    );
+    await maybeWriteFile(`runtime_${tag}.txt`, runtimeLogs.join('\n'));
 
     if (result.evidence.topInvalid || logs.verdict === 'FAIL_INVALID') {
       result.status = 'FAIL_INVALID';
-      result.reason = result.evidence.topInvalid
-        ? '账号或密码错误（顶部出现 Invalid credentials）'
-        : '账号或密码错误（Logs 出现 Error: Invalid credentials）';
+      result.reason = '账号或密码错误（UI 或运行日志检测到 Invalid credentials）';
       result.success = false;
 
-      result.screenshot = `fail_${safeName(user)}.png`;
-      await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+      // reduce leakage: clear password field before screenshot
+      await passInput.fill('').catch(() => {});
+      result.screenshot = `fail_${tag}.png`;
+      await maybeScreenshot(page, result.screenshot);
       return result;
     }
 
     if (ui.success || logs.verdict === 'SUCCESS') {
       result.status = 'SUCCESS';
-      result.reason = ui.success
-        ? (ui.hasMyDomains ? '检测到成功页面: My domains' : '检测到成功文案: exclusive owner...')
-        : '检测到成功日志: Authenticated to authd + dnsmanagerd';
+      result.reason = logs.verdict === 'SUCCESS'
+        ? '运行日志检测到 Authenticated to authd + dnsmanagerd'
+        : (ui.hasMyDomains ? 'UI 检测到 My domains' : 'UI 检测到 owner 文案');
       result.success = true;
       return result;
     }
 
     result.status = 'FAIL_UNKNOWN';
     result.reason = result.evidence.disconnected
-      ? '未能判定：提交后页面仍处于 disconnected（WS不稳定），见截图与 logs_*.txt'
-      : '未能判定：UI 未出现成功/错误条，Logs 也未给出明确 SUCCESS/Invalid（见截图与 logs_*.txt）';
+      ? '未能判定：提交后仍处于 disconnected 或日志不完整（查看 runtime_*.txt 与截图）'
+      : '未能判定：未出现明确 SUCCESS/Invalid（查看 runtime_*.txt 与截图）';
     result.success = false;
 
-    result.screenshot = `unknown_${safeName(user)}.png`;
-    await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+    await passInput.fill('').catch(() => {});
+    result.screenshot = `unknown_${tag}.png`;
+    await maybeScreenshot(page, result.screenshot);
     return result;
 
   } catch (e) {
@@ -525,12 +583,10 @@ async function loginWithAccount(user, pass) {
     result.title = await page?.title?.().catch(() => '') || '';
     result.evidence.disconnected = await isDisconnected(page).catch(() => false);
 
-    result.screenshot = `error_${safeName(user)}.png`;
-    await page.screenshot({ path: path.join(__dirname, result.screenshot), fullPage: true }).catch(() => {});
+    await maybeWriteFile(`runtime_${tag}.txt`, runtimeLogs.join('\n'));
 
-    const logs = await getLoginVerdictFromLogs(page, user).catch(() => ({ snippet: '' }));
-    result.logsSnippet = logs?.snippet || '';
-    await fs.writeFile(path.join(__dirname, `logs_${safeName(user)}.txt`), result.logsSnippet, 'utf8').catch(() => {});
+    result.screenshot = `error_${tag}.png`;
+    await maybeScreenshot(page, result.screenshot);
     return result;
 
   } finally {
@@ -561,7 +617,7 @@ function formatResultBlock(r) {
   if (r.title) s += `Title：${r.title}\n`;
   if (r.url) s += `URL：${r.url}\n`;
   if (r.screenshot) s += `截图：${r.screenshot}\n`;
-  s += `Logs：logs_${safeName(r.user)}.txt\n`;
+  if (saveArtifacts) s += `运行日志：runtime_${fileTag(r.user)}.txt\n`;
 
   if (r.logsSnippet) {
     const preview = r.logsSnippet.split('\n').slice(0, 10).join('\n');
@@ -572,19 +628,18 @@ function formatResultBlock(r) {
 }
 
 async function main() {
-  console.log(`🔍 发现 ${accountList.length} 个账号需要登录`);
+  console.log(`INFO: accounts=${accountList.length}, baseUrl=${baseUrl}, saveArtifacts=${saveArtifacts}`);
 
   const results = [];
 
   for (let i = 0; i < accountList.length; i++) {
     const { user, pass } = accountList[i];
-    console.log(`\n📋 处理第 ${i + 1}/${accountList.length} 个账号: ${user}`);
+    console.log(`\nINFO: account ${i + 1}/${accountList.length}: ${user}`);
 
     const r = await loginWithAccount(user, pass);
     results.push(r);
 
     if (i < accountList.length - 1) {
-      console.log('⏳ 等待3秒后处理下一个账号...');
       await new Promise(res => setTimeout(res, 3000));
     }
   }
@@ -608,7 +663,7 @@ async function main() {
   }
 
   await sendTelegram(msg);
-  console.log('\n✅ 所有账号处理完成！');
+  console.log('INFO: done');
 }
 
 main().catch(err => {
