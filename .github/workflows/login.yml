@@ -2,80 +2,30 @@ name: Netlib Keepalive
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: netlib-keepalive-${{ github.ref }}
-  cancel-in-progress: true
+    - cron: '0 0 */30 * *'  # 每30天运行一次（时间早上8点）
+  workflow_dispatch:  # 允许手动运行
 
 jobs:
   auto_login_netlib:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 25
-
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Cache npm (no lockfile required)
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}-${{ hashFiles('package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+      - name: Install dependencies
+        run: npm install
 
-      - name: Install deps (ci if lockfile exists)
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}-${{ hashFiles('package.json') }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-
-
-      - name: Install Playwright chromium
+      - name: Install Playwright and browser
         run: npx playwright install --with-deps chromium
 
-      - name: Run login script
+      - name: Run lognin script
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
-          # 推荐：ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
-          SAVE_ARTIFACTS: "1"
         run: npm start
-
-      - name: Upload debug artifacts (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: netlib-debug-${{ github.run_id }}
-          path: |
-            *.png
-            runtime_*.txt
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload package-lock.json (if generated)
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: lockfile
-          path: package-lock.json
-          if-no-files-found: ignore
-          retention-days: 7
