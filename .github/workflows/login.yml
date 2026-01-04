@@ -20,10 +20,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 注意：第一次没有 package-lock.json 时，不能开 setup-node 的 npm cache
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
+
+      # 手动缓存 npm 目录（不要求 lockfile 存在）
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
 
       - name: Install dependencies (ci if lockfile exists)
         run: |
@@ -37,7 +46,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
 
       - name: Install Playwright chromium
         run: npx playwright install --with-deps chromium
@@ -49,6 +60,7 @@ jobs:
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
         run: npm start
 
+      # 第一次跑完会生成 package-lock.json，把它打包出来给你网页端下载后提交
       - name: Upload package-lock.json (if generated)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
