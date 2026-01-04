@@ -20,13 +20,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 注意：第一次没有 package-lock.json 时，不能开 setup-node 的 npm cache
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 手动缓存 npm 目录（不要求 lockfile 存在）
-      - name: Cache npm
+      - name: Cache npm (no lockfile required)
         uses: actions/cache@v4
         with:
           path: ~/.npm
@@ -34,7 +32,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-
 
-      - name: Install dependencies (ci if lockfile exists)
+      - name: Install deps (ci if lockfile exists)
         run: |
           if [ -f package-lock.json ]; then
             npm ci
@@ -53,14 +51,26 @@ jobs:
       - name: Install Playwright chromium
         run: npx playwright install --with-deps chromium
 
-      - name: Run
+      - name: Run login script
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ACCOUNTS: ${{ secrets.ACCOUNTS }}
+          # 推荐：ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          SAVE_ARTIFACTS: "1"
         run: npm start
 
-      # 第一次跑完会生成 package-lock.json，把它打包出来给你网页端下载后提交
+      - name: Upload debug artifacts (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netlib-debug-${{ github.run_id }}
+          path: |
+            *.png
+            runtime_*.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Upload package-lock.json (if generated)
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
