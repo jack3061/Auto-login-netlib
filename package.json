@@ -1,12 +1,21 @@
 {
   "name": "keepalive-netlib",
   "version": "1.0.0",
+  "description": "Auto login netlib",
   "main": "login.js",
   "scripts": {
-    "start": "node login.js"
+    "start": "node login.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [
+    "netlib",
+    "auto-login"
+  ],
+  "author": "Jack",
+  "license": "ISC",
   "dependencies": {
-    "axios": "latest",
-    "playwright": "latest"
+    "puppeteer": "^21.5.0",
+    "dotenv": "^16.3.1",
+    "node-schedule": "^2.1.1"
   }
 }
